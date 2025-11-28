@@ -6,10 +6,10 @@ import * as Source from "./source";
 
 // TODO: remove device; it's a backwards compatible alias for source.
 // TODO remove name; it's a backwards compatible alias for path.
-const OBSERVED = ["url", "name", "path", "device", "audio", "video", "controls", "captions", "source"] as const;
+const OBSERVED = ["url", "name", "path", "device", "audio", "video", "controls", "source"] as const;
 type Observed = (typeof OBSERVED)[number];
 
-type SourceType = "camera" | "screen";
+type SourceType = "camera" | "screen" | "file";
 
 export interface HangPublishSignals {
 	url: Signal<URL | undefined>;
@@ -18,8 +18,8 @@ export interface HangPublishSignals {
 	audio: Signal<boolean>;
 	video: Signal<boolean>;
 	controls: Signal<boolean>;
-	captions: Signal<boolean>;
 	source: Signal<SourceType | undefined>;
+	file: Signal<File | undefined>;
 }
 
 export default class HangPublish extends HTMLElement {
@@ -32,8 +32,8 @@ export default class HangPublish extends HTMLElement {
 		audio: new Signal<boolean>(false),
 		video: new Signal<boolean>(false),
 		controls: new Signal(false),
-		captions: new Signal(false),
 		source: new Signal<SourceType | undefined>(undefined),
+		file: new Signal<File | undefined>(undefined),
 	};
 
 	active = new Signal<HangPublishInstance | undefined>(undefined);
@@ -57,7 +57,7 @@ export default class HangPublish extends HTMLElement {
 		} else if (name === "name" || name === "path") {
 			this.path = newValue ?? undefined;
 		} else if (name === "device" || name === "source") {
-			if (newValue === "camera" || newValue === "screen" || newValue === null) {
+			if (newValue === "camera" || newValue === "screen" || newValue === "file" || newValue === null) {
 				this.source = newValue ?? undefined;
 			} else {
 				throw new Error(`Invalid device: ${newValue}`);
@@ -68,8 +68,6 @@ export default class HangPublish extends HTMLElement {
 			this.video = newValue !== null;
 		} else if (name === "controls") {
 			this.controls = newValue !== null;
-		} else if (name === "captions") {
-			this.captions = newValue !== null;
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
@@ -117,6 +115,14 @@ export default class HangPublish extends HTMLElement {
 		this.signals.source.set(source);
 	}
 
+	get file(): File | undefined {
+		return this.signals.file.peek();
+	}
+
+	set file(file: File | undefined) {
+		this.signals.file.set(file);
+	}
+
 	get audio(): boolean {
 		return this.signals.audio.peek();
 	}
@@ -140,17 +146,9 @@ export default class HangPublish extends HTMLElement {
 	set controls(controls: boolean) {
 		this.signals.controls.set(controls);
 	}
-
-	get captions(): boolean {
-		return this.signals.captions.peek();
-	}
-
-	set captions(captions: boolean) {
-		this.signals.captions.set(captions);
-	}
 }
 
-class HangPublishInstance {
+export class HangPublishInstance {
 	parent: HangPublish;
 	connection: Moq.Connection.Reload;
 	broadcast: Broadcast;
@@ -158,6 +156,7 @@ class HangPublishInstance {
 	#preview: Signal<HTMLVideoElement | undefined>;
 	#video = new Signal<Source.Camera | Source.Screen | undefined>(undefined);
 	#audio = new Signal<Source.Microphone | Source.Screen | undefined>(undefined);
+	#file = new Signal<Source.File | undefined>(undefined);
 
 	#signals = new Effect();
 
@@ -184,12 +183,6 @@ class HangPublishInstance {
 
 			audio: {
 				enabled: this.parent.signals.audio,
-				captions: {
-					enabled: this.parent.signals.captions,
-				},
-				speaking: {
-					enabled: this.parent.signals.captions,
-				},
 			},
 			video: {
 				hd: {
@@ -218,7 +211,6 @@ class HangPublishInstance {
 
 		this.#signals.effect(this.#runSource.bind(this));
 		this.#signals.effect(this.#renderControls.bind(this));
-		this.#signals.effect(this.#renderCaptions.bind(this));
 
 		// Keep device signal in sync with source signal for backwards compatibility
 		this.#signals.effect((effect) => {
@@ -280,6 +272,38 @@ class HangPublishInstance {
 
 			return;
 		}
+
+		if (source === "file") {
+			const fileSource = new Source.File({
+				enabled: new Signal(false),
+			});
+
+			effect.effect((effect) => {
+				const file = effect.get(this.parent.signals.file);
+				fileSource.setFile(file);
+				const audio = effect.get(this.parent.signals.audio);
+				const video = effect.get(this.parent.signals.video);
+				effect.set(
+					fileSource.enabled,
+					(audio || video) && Boolean(file),
+					false
+				);
+			});
+
+			fileSource.signals.effect((effect) => {
+				const source = effect.get(fileSource.source);
+				effect.set(this.broadcast.video.source, source.video);
+				effect.set(this.broadcast.audio.source, source.audio);
+			});
+
+			effect.set(this.#file, fileSource);
+
+			effect.cleanup(() => {
+				fileSource.close();
+			});
+
+			return;
+		}
 	}
 
 	#renderControls(effect: Effect) {
@@ -304,49 +328,6 @@ class HangPublishInstance {
 		});
 	}
 
-	#renderCaptions(effect: Effect) {
-		const captions = DOM.create("div", {
-			style: {
-				display: "flex",
-				justifyContent: "space-around",
-				gap: "16px",
-				minHeight: "1lh",
-				alignContent: "center",
-			},
-		});
-
-		DOM.render(effect, this.parent, captions);
-
-		effect.effect((effect) => {
-			const show = effect.get(this.parent.signals.captions);
-			if (!show) return;
-
-			const leftSpacer = DOM.create("div", {
-				style: { width: "1.5em" },
-			});
-
-			const captionText = DOM.create("div", {
-				style: { textAlign: "center" },
-			});
-
-			const speakingIcon = DOM.create("div", {
-				style: { width: "1.5em" },
-			});
-
-			effect.effect((effect) => {
-				const text = effect.get(this.broadcast.audio.captions.text);
-				const speaking = effect.get(this.broadcast.audio.speaking.active);
-
-				captionText.textContent = text ?? "";
-				speakingIcon.textContent = speaking ? "🗣️" : " ";
-			});
-
-			DOM.render(effect, captions, leftSpacer);
-			DOM.render(effect, captions, captionText);
-			DOM.render(effect, captions, speakingIcon);
-		});
-	}
-
 	#renderSelect(parent: HTMLDivElement, effect: Effect) {
 		const container = DOM.create(
 			"div",
@@ -362,6 +343,7 @@ class HangPublishInstance {
 		this.#renderMicrophone(container, effect);
 		this.#renderCamera(container, effect);
 		this.#renderScreen(container, effect);
+		this.#renderFile(container, effect);
 		this.#renderNothing(container, effect);
 
 		DOM.render(effect, parent, container);
@@ -562,6 +544,45 @@ class HangPublishInstance {
 		});
 
 		DOM.render(effect, parent, screen);
+	}
+
+	#renderFile(parent: HTMLDivElement, effect: Effect) {
+		const fileInput = DOM.create("input", {
+			type: "file",
+			accept: "video/*,audio/*,image/*",
+			style: { display: "none" },
+		});
+
+		const button = DOM.create(
+			"button",
+			{
+				type: "button",
+				title: "Upload File",
+				style: { cursor: "pointer" },
+			},
+			"📁",
+		);
+
+		DOM.render(effect, parent, fileInput);
+		DOM.render(effect, parent, button);
+
+		effect.event(button, "click", () => fileInput.click());
+
+		effect.event(fileInput, "change", (e) => {
+			const file = (e.target as HTMLInputElement).files?.[0];
+			if (file) {
+				this.parent.file = file;
+				this.parent.source = "file";
+				this.parent.video = true;
+				this.parent.audio = true;
+				(e.target as HTMLInputElement).value = "";
+			}
+		});
+
+		effect.effect((effect) => {
+			const selected = effect.get(this.parent.signals.source);
+			button.style.opacity = selected === "file" ? "1" : "0.5";
+		});
 	}
 
 	#renderNothing(parent: HTMLDivElement, effect: Effect) {

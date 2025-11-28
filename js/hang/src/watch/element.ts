@@ -4,20 +4,9 @@ import * as DOM from "@kixelated/signals/dom";
 import type * as Time from "../time";
 import * as Audio from "./audio";
 import { Broadcast } from "./broadcast";
-import * as Video from "./video";
+import { Renderer } from "./video";
 
-const OBSERVED = [
-	"url",
-	"name",
-	"path",
-	"paused",
-	"volume",
-	"muted",
-	"controls",
-	"captions",
-	"reload",
-	"latency",
-] as const;
+const OBSERVED = ["url", "name", "path", "paused", "volume", "muted", "controls", "reload", "latency"] as const;
 type Observed = (typeof OBSERVED)[number];
 
 export interface HangWatchSignals {
@@ -27,7 +16,6 @@ export interface HangWatchSignals {
 	volume: Signal<number>;
 	muted: Signal<boolean>;
 	controls: Signal<boolean>;
-	captions: Signal<boolean>;
 	reload: Signal<boolean>;
 	latency: Signal<Time.Milli>;
 }
@@ -57,9 +45,6 @@ export default class HangWatch extends HTMLElement {
 		// Whether the controls are shown.
 		controls: new Signal(false),
 
-		// Whether the captions are shown.
-		captions: new Signal(false),
-
 		// Don't automatically reload the broadcast.
 		// TODO: Temporarily defaults to false because Cloudflare doesn't support it yet.
 		reload: new Signal(false),
@@ -74,6 +59,8 @@ export default class HangWatch extends HTMLElement {
 	// Annoyingly, we have to use these callbacks to figure out when the element is connected to the DOM.
 	// This wouldn't be so bad if there was a destructor for web components to clean up our effects.
 	connectedCallback() {
+		this.style.display = "block";
+		this.style.position = "relative";
 		this.active.set(new HangWatchInstance(this));
 	}
 
@@ -103,8 +90,6 @@ export default class HangWatch extends HTMLElement {
 			this.muted = newValue !== null;
 		} else if (name === "controls") {
 			this.controls = newValue !== null;
-		} else if (name === "captions") {
-			this.captions = newValue !== null;
 		} else if (name === "reload") {
 			this.reload = newValue !== null;
 		} else if (name === "latency") {
@@ -173,14 +158,6 @@ export default class HangWatch extends HTMLElement {
 		this.signals.controls.set(controls);
 	}
 
-	get captions(): boolean {
-		return this.signals.captions.peek();
-	}
-
-	set captions(captions: boolean) {
-		this.signals.captions.set(captions);
-	}
-
 	get reload(): boolean {
 		return this.signals.reload.peek();
 	}
@@ -200,14 +177,14 @@ export default class HangWatch extends HTMLElement {
 
 // An instance of HangWatch once its inserted into the DOM.
 // We do this otherwise every variable could be undefined; which is annoying in Typescript.
-class HangWatchInstance {
+export class HangWatchInstance {
 	parent: HangWatch;
 
 	// You can construct these manually if you want to use the library without the web component.
 	// However be warned that the API is still in flux and may change.
 	connection: Moq.Connection.Reload;
 	broadcast: Broadcast;
-	video: Video.Renderer;
+	video: Renderer;
 	audio: Audio.Emitter;
 	#signals: Effect;
 
@@ -224,12 +201,6 @@ class HangWatchInstance {
 			enabled: true,
 			reload: this.parent.signals.reload,
 			audio: {
-				captions: {
-					enabled: this.parent.signals.captions,
-				},
-				speaking: {
-					enabled: this.parent.signals.captions,
-				},
 				latency: this.parent.signals.latency,
 			},
 			video: {
@@ -247,7 +218,7 @@ class HangWatchInstance {
 		observer.observe(this.parent, { childList: true, subtree: true });
 		this.#signals.cleanup(() => observer.disconnect());
 
-		this.video = new Video.Renderer(this.broadcast.video, { canvas, paused: this.parent.signals.paused });
+		this.video = new Renderer(this.broadcast.video, { canvas, paused: this.parent.signals.paused });
 		this.audio = new Audio.Emitter(this.broadcast.audio, {
 			volume: this.parent.signals.volume,
 			muted: this.parent.signals.muted,
@@ -314,7 +285,6 @@ class HangWatchInstance {
 		});
 
 		this.#signals.effect(this.#renderControls.bind(this));
-		this.#signals.effect(this.#renderCaptions.bind(this));
 	}
 
 	close() {
@@ -345,45 +315,7 @@ class HangWatchInstance {
 			this.#renderVolume(controls, effect);
 			this.#renderStatus(controls, effect);
 			this.#renderFullscreen(controls, effect);
-		});
-	}
-
-	#renderCaptions(effect: Effect) {
-		const captions = DOM.create("div", {
-			style: {
-				textAlign: "center",
-			},
-		});
-
-		DOM.render(effect, this.parent, captions);
-
-		effect.effect((effect) => {
-			const show = effect.get(this.parent.signals.captions);
-			if (!show) return;
-
-			const leftSpacer = DOM.create("div", {
-				style: { width: "1.5em" },
-			});
-
-			const captionText = DOM.create("div", {
-				style: { textAlign: "center" },
-			});
-
-			const speakingIcon = DOM.create("div", {
-				style: { width: "1.5em" },
-			});
-
-			effect.effect((effect) => {
-				const text = effect.get(this.broadcast.audio.captions.text);
-				const speaking = effect.get(this.broadcast.audio.speaking.active);
-
-				captionText.textContent = text ?? "";
-				speakingIcon.textContent = speaking ? "🗣️" : " ";
-			});
-
-			DOM.render(effect, captions, leftSpacer);
-			DOM.render(effect, captions, captionText);
-			DOM.render(effect, captions, speakingIcon);
+			this.#renderBuffering(effect);
 		});
 	}
 
@@ -506,6 +438,63 @@ class HangWatchInstance {
 		});
 
 		DOM.render(effect, parent, button);
+	}
+
+	#renderBuffering(effect: Effect) {
+		if (!document.getElementById("buffer-spinner-animation")) {
+			const style = document.createElement("style");
+			style.id = "buffer-spinner-animation";
+			style.textContent = `
+				@keyframes buffer-spin {
+					0% { transform: rotate(0deg); }
+					100% { transform: rotate(360deg); }
+				}
+			`;
+			document.head.appendChild(style);
+		}
+
+		const container = DOM.create("div", {
+			style: {
+				position: "absolute",
+				display: "none",
+				justifyContent: "center",
+				alignItems: "center",
+				width: "100%",
+				height: "100%",
+				top: "0",
+				left: "0",
+				zIndex: "1",
+				backgroundColor: "rgba(0, 0, 0, 0.4)",
+				backdropFilter: "blur(2px)",
+				pointerEvents: "auto",
+			},
+		});
+
+		const spinner = DOM.create("div", {
+			style: {
+				width: "40px",
+				height: "40px",
+				border: "4px solid rgba(255, 255, 255, 0.2)",
+				borderTop: "4px solid #fff",
+				borderRadius: "50%",
+				animation: "buffer-spin 1s linear infinite",
+			},
+		});
+
+		container.appendChild(spinner);
+
+		effect.effect((effect) => {
+			const syncStatus = effect.get(this.video.source.syncStatus);
+			const bufferStatus = effect.get(this.video.source.bufferStatus);
+			const shouldShow = syncStatus.state === "wait" || bufferStatus.state === "empty";
+			if (shouldShow) {
+				container.style.display = "flex";
+			} else {
+				container.style.display = "none";
+			}
+		});
+
+		DOM.render(effect, this.parent, container);
 	}
 }
 

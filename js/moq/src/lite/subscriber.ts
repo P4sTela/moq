@@ -9,6 +9,7 @@ import { Announce, AnnounceInit, AnnounceInterest } from "./announce.ts";
 import type { Group as GroupMessage } from "./group.ts";
 import { StreamId } from "./stream.ts";
 import { Subscribe, SubscribeOk } from "./subscribe.ts";
+import type { Version } from "./version.ts";
 
 /**
  * Handles subscribing to broadcasts and managing their lifecycle.
@@ -17,6 +18,9 @@ import { Subscribe, SubscribeOk } from "./subscribe.ts";
  */
 export class Subscriber {
 	#quic: WebTransport;
+
+	// The version of the connection.
+	readonly version: Version;
 
 	// Our subscribed tracks.
 	#subscribes = new Map<bigint, Track>();
@@ -28,8 +32,9 @@ export class Subscriber {
 	 *
 	 * @internal
 	 */
-	constructor(quic: WebTransport) {
+	constructor(quic: WebTransport, version: Version) {
 		this.#quic = quic;
+		this.version = version;
 	}
 
 	/**
@@ -47,7 +52,7 @@ export class Subscriber {
 		try {
 			// Open a stream and send the announce interest.
 			const stream = await Stream.open(this.#quic);
-			await stream.writer.u8(StreamId.Announce);
+			await stream.writer.u53(StreamId.Announce);
 			await msg.encode(stream.writer);
 
 			// First, receive ANNOUNCE_INIT
@@ -109,11 +114,11 @@ export class Subscriber {
 		const msg = new Subscribe(id, broadcast, request.track.name, request.priority);
 
 		const stream = await Stream.open(this.#quic);
-		await stream.writer.u8(StreamId.Subscribe);
+		await stream.writer.u53(StreamId.Subscribe);
 		await msg.encode(stream.writer);
 
 		try {
-			await SubscribeOk.decode(stream.reader);
+			await SubscribeOk.decode(stream.reader, this.version);
 			console.debug(`subscribe ok: id=${id} broadcast=${broadcast} track=${request.track.name}`);
 
 			await Promise.race([stream.reader.closed, request.track.closed]);

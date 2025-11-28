@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use crate::{
-	coding::{Decode, DecodeError, Encode, Message},
+	coding::{Decode, DecodeError, Encode},
+	lite::{Message, Version},
 	Path,
 };
 
@@ -17,11 +18,11 @@ pub struct Subscribe<'a> {
 }
 
 impl<'a> Message for Subscribe<'a> {
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let id = u64::decode(r)?;
-		let broadcast = Path::decode(r)?;
-		let track = Cow::<str>::decode(r)?;
-		let priority = u8::decode(r)?;
+	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		let id = u64::decode(r, version)?;
+		let broadcast = Path::decode(r, version)?;
+		let track = Cow::<str>::decode(r, version)?;
+		let priority = u8::decode(r, version)?;
 
 		Ok(Self {
 			id,
@@ -31,11 +32,11 @@ impl<'a> Message for Subscribe<'a> {
 		})
 	}
 
-	fn encode<W: bytes::BufMut>(&self, w: &mut W) {
-		self.id.encode(w);
-		self.broadcast.encode(w);
-		self.track.encode(w);
-		self.priority.encode(w);
+	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) {
+		self.id.encode(w, version);
+		self.broadcast.encode(w, version);
+		self.track.encode(w, version);
+		self.priority.encode(w, version);
 	}
 }
 
@@ -45,12 +46,19 @@ pub struct SubscribeOk {
 }
 
 impl Message for SubscribeOk {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W) {
-		self.priority.encode(w);
+	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) {
+		if version == Version::Draft01 {
+			self.priority.encode(w, version);
+		}
 	}
 
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let priority = u8::decode(r)?;
+	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		let priority = if version == Version::Draft01 {
+			u8::decode(r, version)?
+		} else {
+			0
+		};
+
 		Ok(Self { priority })
 	}
 }

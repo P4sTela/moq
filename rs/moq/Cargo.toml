@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/kixelated/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.8.1"
+version = "0.10.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -18,6 +18,7 @@ serde = ["dep:serde"]
 async-channel = "2"
 bytes = "1"
 futures = "0.3"
+hex = "0.4"
 num_enum = "0.7"
 serde = { workspace = true, optional = true }
 thiserror = "2"
@@ -30,9 +31,3 @@ tokio = { workspace = true, features = [
 tracing = "0.1"
 web-async = { workspace = true }
 web-transport-trait = { workspace = true }
-
-[dev-dependencies]
-anyhow = "1"
-moq-native = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
-url = "2"

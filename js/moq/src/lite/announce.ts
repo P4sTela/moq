@@ -1,5 +1,6 @@
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import * as Message from "./message.ts";
 
 export class Announce {
 	suffix: Path.Valid;
@@ -11,26 +12,26 @@ export class Announce {
 	}
 
 	async #encode(w: Writer) {
-		await w.u8(this.active ? 1 : 0);
+		await w.bool(this.active);
 		await w.string(this.suffix);
 	}
 
 	static async #decode(r: Reader): Promise<Announce> {
-		const active = (await r.u8()) === 1;
+		const active = await r.bool();
 		const suffix = Path.from(await r.string());
 		return new Announce(suffix, active);
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<Announce> {
-		return r.message(Announce.#decode);
+		return Message.decode(r, Announce.#decode);
 	}
 
 	static async decodeMaybe(r: Reader): Promise<Announce | undefined> {
-		return r.messageMaybe(Announce.#decode);
+		return Message.decodeMaybe(r, Announce.#decode);
 	}
 }
 
@@ -51,11 +52,11 @@ export class AnnounceInterest {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<AnnounceInterest> {
-		return r.message(AnnounceInterest.#decode);
+		return Message.decode(r, AnnounceInterest.#decode);
 	}
 }
 
@@ -83,10 +84,10 @@ export class AnnounceInit {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<AnnounceInit> {
-		return r.message(AnnounceInit.#decode);
+		return Message.decode(r, AnnounceInit.#decode);
 	}
 }

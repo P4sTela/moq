@@ -208,7 +208,7 @@ in
         MOQ_LOG_LEVEL = lib.mkDefault cfg.logLevel;
 
         # Server configuration
-        MOQ_SERVER_LISTEN = "[::]:${toString cfg.port}";
+        MOQ_SERVER_BIND = "[::]:${toString cfg.port}";
 
         MOQ_CLIENT_TLS_DISABLE_VERIFY = lib.boolToString cfg.cluster.disableTlsVerify;
       } // lib.optionalAttrs (cfg.tls.generate != [ ]) {
@@ -225,11 +225,11 @@ in
         MOQ_AUTH_PUBLIC = cfg.auth.publicPath;
       } // lib.optionalAttrs (cfg.cluster.rootUrl != null) {
         # Cluster configuration
-        MOQ_CLUSTER_CONNECT = cfg.cluster.rootUrl;
+        MOQ_CLUSTER_ROOT = cfg.cluster.rootUrl;
       } // lib.optionalAttrs (cfg.cluster.mode != "none") {
         MOQ_CLUSTER_TOKEN = if cfg.cluster.tokenFile != null then cfg.cluster.tokenFile else "${cfg.stateDir}/cluster.jwt";
       } // lib.optionalAttrs (cfg.cluster.nodeUrl != null) {
-        MOQ_CLUSTER_ADVERTISE = cfg.cluster.nodeUrl;
+        MOQ_CLUSTER_NODE = cfg.cluster.nodeUrl;
       };
     };
   };

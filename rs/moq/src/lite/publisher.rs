@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use web_async::FuturesExt;
-use web_transport_trait::SendStream;
 
 use crate::{
 	coding::{Stream, Writer},
-	lite,
+	lite::{
+		self,
+		priority::{PriorityHandle, PriorityQueue},
+		Version,
+	},
 	model::GroupConsumer,
 	AsPath, BroadcastConsumer, Error, Origin, OriginConsumer, Track, TrackConsumer,
 };
@@ -13,36 +16,41 @@ use crate::{
 pub(super) struct Publisher<S: web_transport_trait::Session> {
 	session: S,
 	origin: OriginConsumer,
+	priority: PriorityQueue,
+	version: Version,
 }
 
 impl<S: web_transport_trait::Session> Publisher<S> {
-	pub fn new(session: S, origin: Option<OriginConsumer>) -> Self {
+	pub fn new(session: S, origin: Option<OriginConsumer>, version: Version) -> Self {
 		// Default to a dummy origin that is immediately closed.
 		let origin = origin.unwrap_or_else(|| Origin::produce().consumer);
-		Self { session, origin }
+		Self {
+			session,
+			origin,
+			priority: Default::default(),
+			version,
+		}
 	}
 
 	pub async fn run(mut self) -> Result<(), Error> {
 		loop {
-			let mut stream = Stream::accept(&self.session).await?;
+			let mut stream = Stream::accept(&self.session, self.version).await?;
 
 			// To avoid cloning the origin, we process each control stream in received order.
 			// This adds some head-of-line blocking but it delays an expensive clone.
 			let kind = stream.reader.decode().await?;
 
 			if let Err(err) = match kind {
-				lite::ControlType::Session | lite::ControlType::ClientCompat | lite::ControlType::ServerCompat => {
-					Err(Error::UnexpectedStream)
-				}
 				lite::ControlType::Announce => self.recv_announce(stream).await,
 				lite::ControlType::Subscribe => self.recv_subscribe(stream).await,
+				_ => Err(Error::UnexpectedStream),
 			} {
 				tracing::warn!(%err, "control stream error");
 			}
 		}
 	}
 
-	pub async fn recv_announce(&mut self, mut stream: Stream<S>) -> Result<(), Error> {
+	pub async fn recv_announce(&mut self, mut stream: Stream<S, Version>) -> Result<(), Error> {
 		let interest = stream.reader.decode::<lite::AnnouncePlease>().await?;
 		let prefix = interest.prefix.to_owned();
 
@@ -78,7 +86,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 	}
 
 	async fn run_announce(
-		stream: &mut Stream<S>,
+		stream: &mut Stream<S, Version>,
 		origin: &mut OriginConsumer,
 		prefix: impl AsPath,
 	) -> Result<(), Error> {
@@ -123,14 +131,17 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 								stream.writer.encode(&msg).await?;
 							}
 						},
-						None => return stream.writer.finish().await,
+						None => {
+							stream.writer.finish()?;
+							return stream.writer.closed().await;
+						}
 					}
 				}
 			}
 		}
 	}
 
-	pub async fn recv_subscribe(&mut self, mut stream: Stream<S>) -> Result<(), Error> {
+	pub async fn recv_subscribe(&mut self, mut stream: Stream<S, Version>) -> Result<(), Error> {
 		let subscribe = stream.reader.decode::<lite::Subscribe>().await?;
 
 		let id = subscribe.id;
@@ -140,10 +151,13 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		tracing::info!(%id, broadcast = %absolute, %track, "subscribed started");
 
 		let broadcast = self.origin.consume_broadcast(&subscribe.broadcast);
+		let priority = self.priority.clone();
+		let version = self.version;
 
 		let session = self.session.clone();
 		web_async::spawn(async move {
-			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast).await {
+			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast, priority, version).await
+			{
 				match &err {
 					// TODO better classify WebTransport errors.
 					Error::Cancel | Error::Transport(_) => {
@@ -164,9 +178,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 	async fn run_subscribe(
 		session: S,
-		stream: &mut Stream<S>,
+		stream: &mut Stream<S, Version>,
 		subscribe: &lite::Subscribe<'_>,
 		consumer: Option<BroadcastConsumer>,
+		priority: PriorityQueue,
+		version: Version,
 	) -> Result<(), Error> {
 		let track = Track {
 			name: subscribe.track.to_string(),
@@ -185,14 +201,21 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		stream.writer.encode(&info).await?;
 
 		tokio::select! {
-			res = Self::run_track(session, track, subscribe) => res?,
+			res = Self::run_track(session, track, subscribe, priority, version) => res?,
 			res = stream.reader.closed() => res?,
 		}
 
-		stream.writer.finish().await
+		stream.writer.finish()?;
+		stream.writer.closed().await
 	}
 
-	async fn run_track(session: S, mut track: TrackConsumer, subscribe: &lite::Subscribe<'_>) -> Result<(), Error> {
+	async fn run_track(
+		session: S,
+		mut track: TrackConsumer,
+		subscribe: &lite::Subscribe<'_>,
+		priority: PriorityQueue,
+		version: Version,
+	) -> Result<(), Error> {
 		// TODO use a BTreeMap serve the latest N groups by sequence.
 		// Until then, we'll implement N=2 manually.
 		// Also, this is more complicated because we can't use tokio because of WASM.
@@ -237,15 +260,16 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				continue;
 			}
 
-			let priority = stream_priority(track.info.priority, sequence);
 			let msg = lite::Group {
 				subscribe: subscribe.id,
 				sequence,
 			};
 
+			let priority = priority.insert(track.info.priority, sequence);
+
 			// Spawn a task to serve this group, ignoring any errors because they don't really matter.
 			// TODO add some logging at least.
-			let handle = Box::pin(Self::serve_group(session.clone(), msg, priority, group));
+			let handle = Box::pin(Self::serve_group(session.clone(), msg, priority, group, version));
 
 			// Terminate the old group if it's still running.
 			if let Some(old_sequence) = old_sequence.take() {
@@ -268,15 +292,21 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		}
 	}
 
-	async fn serve_group(session: S, msg: lite::Group, priority: i32, mut group: GroupConsumer) -> Result<(), Error> {
+	async fn serve_group(
+		session: S,
+		msg: lite::Group,
+		mut priority: PriorityHandle,
+		mut group: GroupConsumer,
+		version: Version,
+	) -> Result<(), Error> {
 		// TODO add a way to open in priority order.
-		let mut stream = session
+		let stream = session
 			.open_uni()
 			.await
 			.map_err(|err| Error::Transport(Arc::new(err)))?;
-		stream.set_priority(priority);
 
-		let mut stream = Writer::new(stream);
+		let mut stream = Writer::new(stream, version);
+		stream.set_priority(priority.current());
 		stream.encode(&lite::DataType::Group).await?;
 		stream.encode(&msg).await?;
 
@@ -285,6 +315,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				biased;
 				_ = stream.closed() => return Err(Error::Cancel),
 				frame = group.next_frame() => frame,
+				// Update the priority if it changes.
+				priority = priority.next() => {
+					stream.set_priority(priority);
+					continue;
+				}
 			};
 
 			let mut frame = match frame? {
@@ -301,6 +336,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					biased;
 					_ = stream.closed() => return Err(Error::Cancel),
 					chunk = frame.read_chunk() => chunk,
+					// Update the priority if it changes.
+					priority = priority.next() => {
+						stream.set_priority(priority);
+						continue;
+					}
 				};
 
 				match chunk? {
@@ -312,41 +352,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			tracing::trace!(size = %frame.info.size, "wrote frame");
 		}
 
-		stream.finish().await?;
+		stream.finish()?;
+		stream.closed().await?;
 
 		tracing::debug!(sequence = %msg.sequence, "finished group");
 
 		Ok(())
-	}
-}
-
-// Quinn takes a i32 priority.
-// We do our best to distill 70 bits of information into 32 bits, but overflows will happen.
-// Specifically, group sequence 2^24 will overflow and be incorrectly prioritized.
-// But even with a group per frame, it will take ~6 days to reach that point.
-// TODO The behavior when two tracks share the same priority is undefined. Should we round-robin?
-fn stream_priority(track_priority: u8, group_sequence: u64) -> i32 {
-	let sequence = 0xFFFFFF - (group_sequence as u32 & 0xFFFFFF);
-	((track_priority as i32) << 24) | sequence as i32
-}
-
-#[cfg(test)]
-mod test {
-	use super::*;
-
-	#[test]
-	fn priority() {
-		let assert = |track_priority, group_sequence, expected| {
-			assert_eq!(stream_priority(track_priority, group_sequence), expected);
-		};
-
-		const U24: i32 = (1 << 24) - 1;
-
-		// NOTE: The lower the value, the higher the priority for Quinn.
-		// MoQ does the opposite, so we invert the values.
-		assert(0, 50, U24 - 50);
-		assert(0, 0, U24);
-		assert(1, 50, 2 * U24 - 49);
-		assert(1, 0, 2 * U24 + 1);
 	}
 }

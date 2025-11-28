@@ -1,4 +1,7 @@
-use crate::coding::*;
+use crate::{
+	coding::*,
+	lite::{self, Message, Parameters},
+};
 
 /// Sent by the client to setup the session.
 #[derive(Debug, Clone)]
@@ -7,22 +10,22 @@ pub struct ClientSetup {
 	pub versions: Versions,
 
 	/// Extensions.
-	pub extensions: Extensions,
+	pub parameters: Parameters,
 }
 
 impl Message for ClientSetup {
 	/// Decode a client setup message.
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let versions = Versions::decode(r)?;
-		let extensions = Extensions::decode(r)?;
+	fn decode_msg<R: bytes::Buf>(r: &mut R, version: lite::Version) -> Result<Self, DecodeError> {
+		let versions = Versions::decode(r, version)?;
+		let parameters = Parameters::decode(r, version)?;
 
-		Ok(Self { versions, extensions })
+		Ok(Self { versions, parameters })
 	}
 
 	/// Encode a client setup message.
-	fn encode<W: bytes::BufMut>(&self, w: &mut W) {
-		self.versions.encode(w);
-		self.extensions.encode(w);
+	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: lite::Version) {
+		self.versions.encode(w, version);
+		self.parameters.encode(w, version);
 	}
 }
 
@@ -33,19 +36,19 @@ pub struct ServerSetup {
 	pub version: Version,
 
 	/// Supported extensions.
-	pub extensions: Extensions,
+	pub parameters: Parameters,
 }
 
 impl Message for ServerSetup {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W) {
-		self.version.encode(w);
-		self.extensions.encode(w);
+	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: lite::Version) {
+		self.version.encode(w, version);
+		self.parameters.encode(w, version);
 	}
 
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let version = Version::decode(r)?;
-		let extensions = Extensions::decode(r)?;
+	fn decode_msg<R: bytes::Buf>(r: &mut R, version: lite::Version) -> Result<Self, DecodeError> {
+		let version = Version::decode(r, version)?;
+		let parameters = Parameters::decode(r, version)?;
 
-		Ok(Self { version, extensions })
+		Ok(Self { version, parameters })
 	}
 }

@@ -1,113 +1,140 @@
 import type { Reader, Writer } from "../stream.ts";
 
-const SUBGROUP_ID = 0x0; // Must always be layer 0
-const STREAM_TYPE = 0x04;
 const GROUP_END = 0x03;
+
+export interface GroupFlags {
+	hasExtensions: boolean;
+	hasSubgroup: boolean;
+	hasSubgroupObject: boolean;
+	hasEnd: boolean;
+}
 
 /**
  * STREAM_HEADER_SUBGROUP from moq-transport spec.
  * Used for stream-per-group delivery mode.
  */
 export class Group {
-	static id = STREAM_TYPE;
-
-	subscribeId: bigint;
+	flags: GroupFlags;
 	trackAlias: bigint;
 	groupId: number;
+	subGroupId: number;
 	publisherPriority: number;
 
-	constructor(subscribeId: bigint, trackAlias: bigint, groupId: number, publisherPriority: number) {
-		this.subscribeId = subscribeId;
+	constructor(trackAlias: bigint, groupId: number, subGroupId: number, publisherPriority: number, flags: GroupFlags) {
+		this.flags = flags;
 		this.trackAlias = trackAlias;
 		this.groupId = groupId;
+		this.subGroupId = subGroupId;
 		this.publisherPriority = publisherPriority;
 	}
 
 	async encode(w: Writer): Promise<void> {
-		// Stream type is written by the caller
-		await w.u62(this.subscribeId);
+		if (!this.flags.hasSubgroup && this.subGroupId !== 0) {
+			throw new Error(`Subgroup ID must be 0 if hasSubgroup is false: ${this.subGroupId}`);
+		}
+
+		let id = 0x10;
+		if (this.flags.hasExtensions) {
+			id |= 0x01;
+		}
+		if (this.flags.hasSubgroupObject) {
+			id |= 0x02;
+		}
+		if (this.flags.hasSubgroup) {
+			id |= 0x04;
+		}
+		if (this.flags.hasEnd) {
+			id |= 0x08;
+		}
+		await w.u53(id);
 		await w.u62(this.trackAlias);
 		await w.u53(this.groupId);
-		await w.u8(SUBGROUP_ID);
-		await w.u8(this.publisherPriority);
+		if (this.flags.hasSubgroup) {
+			await w.u53(this.subGroupId);
+		}
+		await w.u8(0); // publisher priority
 	}
 
 	static async decode(r: Reader): Promise<Group> {
-		const subscribeId = await r.u62();
+		const id = await r.u53();
+		if (id < 0x10 || id > 0x1f) {
+			throw new Error(`Unsupported group type: ${id}`);
+		}
+
+		const flags = {
+			hasExtensions: (id & 0x01) !== 0,
+			hasSubgroupObject: (id & 0x02) !== 0,
+			hasSubgroup: (id & 0x04) !== 0,
+			hasEnd: (id & 0x08) !== 0,
+		};
+
 		const trackAlias = await r.u62();
 		const groupId = await r.u53();
-		const subgroupId = await r.u53();
-		if (subgroupId !== SUBGROUP_ID) {
-			throw new Error(`Unsupported subgroup id: ${subgroupId}`);
-		}
-		const publisherPriority = await r.u8();
+		const subGroupId = flags.hasSubgroup ? await r.u53() : 0;
+		const publisherPriority = await r.u8(); // Don't care about publisher priority
 
-		return new Group(subscribeId, trackAlias, groupId, publisherPriority);
+		return new Group(trackAlias, groupId, subGroupId, publisherPriority, flags);
 	}
 }
 
 export class Frame {
-	id: number;
-
 	// undefined means end of group
 	payload?: Uint8Array;
 
-	constructor(id: number, payload?: Uint8Array) {
-		this.id = id;
+	constructor(payload?: Uint8Array) {
 		this.payload = payload;
 	}
 
-	async encode(w: Writer): Promise<void> {
-		await w.u53(this.id);
+	async encode(w: Writer, flags: GroupFlags): Promise<void> {
+		await w.u53(0); // id_delta = 0
+
+		if (flags.hasExtensions) {
+			await w.u53(0); // extensions length = 0
+		}
 
 		if (this.payload !== undefined) {
 			await w.u53(this.payload.byteLength);
 
 			if (this.payload.byteLength === 0) {
-				await w.u8(0); // status = normal
+				await w.u53(0); // status = normal
 			} else {
 				await w.write(this.payload);
 			}
 		} else {
-			await w.u8(0); // length = 0
-			await w.u8(GROUP_END);
+			await w.u53(0); // length = 0
+			await w.u53(GROUP_END);
 		}
 	}
 
-	static async decode(r: Reader): Promise<Frame> {
-		const id = await r.u53();
+	static async decode(r: Reader, flags: GroupFlags): Promise<Frame> {
+		const delta = await r.u53();
+		if (delta !== 0) {
+			console.warn(`object ID delta is not supported, ignoring: ${delta}`);
+		}
+
+		if (flags.hasExtensions) {
+			const extensionsLength = await r.u53();
+			// We don't care about extensions
+			await r.read(extensionsLength);
+		}
 
 		const payloadLength = await r.u53();
 
 		if (payloadLength > 0) {
 			const payload = await r.read(payloadLength);
-			return new Frame(id, payload);
+			return new Frame(payload);
 		}
 
 		const status = await r.u53();
 
-		// TODO status === 0 should be an empty frame, but moq-rs seems to be sending it incorrectly on group end.
-		if (status === 0 || status === GROUP_END) {
-			return new Frame(id);
+		if (flags.hasEnd) {
+			// Empty frame
+			if (status === 0) return new Frame(new Uint8Array(0));
+		} else if (status === 0 || status === GROUP_END) {
+			// TODO status === 0 should be an empty frame, but moq-rs seems to be sending it incorrectly on group end.
+			return new Frame();
 		}
 
 		throw new Error(`Unsupported object status: ${status}`);
 	}
-}
-
-/**
- * Helper to read a stream type from a reader.
- */
-export async function readStreamType(r: Reader): Promise<void> {
-	const streamType = await r.u53();
-	if (streamType !== STREAM_TYPE) {
-		throw new Error(`Unsupported stream type: ${streamType}`);
-	}
-}
-
-/**
- * Helper to write a stream type to a writer.
- */
-export async function writeStreamType(w: Writer): Promise<void> {
-	await w.u53(STREAM_TYPE);
 }

@@ -4,20 +4,28 @@ import type { Established } from "../connection/established.ts";
 import * as Path from "../path.js";
 import { type Reader, Readers, type Stream } from "../stream.ts";
 import { unreachable } from "../util/index.ts";
-import { Announce, AnnounceCancel, AnnounceError, AnnounceOk, Unannounce } from "./announce.ts";
 import * as Control from "./control.ts";
-import { Fetch, FetchError, FetchOk } from "./fetch.ts";
+import { Fetch, FetchCancel, FetchError, FetchOk } from "./fetch.ts";
 import { GoAway } from "./goaway.ts";
-import { Group as GroupMessage, readStreamType } from "./object.ts";
-import { Publisher } from "./publisher.ts";
-import * as Setup from "./setup.ts";
-import { Subscribe, SubscribeDone, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
+import { Group } from "./object.ts";
+import { Publish, PublishDone, PublishError, PublishOk } from "./publish.ts";
 import {
-	SubscribeAnnounces,
-	SubscribeAnnouncesError,
-	SubscribeAnnouncesOk,
-	UnsubscribeAnnounces,
-} from "./subscribe_announces.ts";
+	PublishNamespace,
+	PublishNamespaceCancel,
+	PublishNamespaceDone,
+	PublishNamespaceError,
+	PublishNamespaceOk,
+} from "./publish_namespace.ts";
+import { Publisher } from "./publisher.ts";
+import { MaxRequestId, RequestsBlocked } from "./request.ts";
+import * as Setup from "./setup.ts";
+import { Subscribe, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
+import {
+	SubscribeNamespace,
+	SubscribeNamespaceError,
+	SubscribeNamespaceOk,
+	UnsubscribeNamespace,
+} from "./subscribe_namespace.ts";
 import { Subscriber } from "./subscriber.ts";
 import { TrackStatus, TrackStatusRequest } from "./track.ts";
 
@@ -42,6 +50,9 @@ export class Connection implements Established {
 	// Module for distributing tracks.
 	#subscriber: Subscriber;
 
+	// Just to avoid logging when `close()` is called.
+	#closed = false;
+
 	/**
 	 * Creates a new Connection instance.
 	 * @param url - The URL of the connection
@@ -50,20 +61,29 @@ export class Connection implements Established {
 	 *
 	 * @internal
 	 */
-	constructor(url: URL, quic: WebTransport, control: Stream) {
+	constructor(url: URL, quic: WebTransport, control: Stream, maxRequestId: bigint) {
 		this.url = url;
 		this.#quic = quic;
-		this.#control = new Control.Stream(control);
+		this.#control = new Control.Stream(control, maxRequestId);
+
+		this.#quic.closed.finally(() => {
+			this.#control.close();
+		});
+
 		this.#publisher = new Publisher(this.#quic, this.#control);
 		this.#subscriber = new Subscriber(this.#control);
 
-		this.#run();
+		void this.#run();
 	}
 
 	/**
 	 * Closes the connection.
 	 */
 	close() {
+		if (this.#closed) return;
+
+		this.#closed = true;
+
 		try {
 			this.#quic.close();
 		} catch {
@@ -78,7 +98,9 @@ export class Connection implements Established {
 		try {
 			await Promise.all([controlMessages, objectStreams]);
 		} catch (err) {
-			console.error("fatal error running connection", err);
+			if (!this.#closed) {
+				console.error("fatal error running connection", err);
+			}
 		} finally {
 			this.close();
 		}
@@ -131,48 +153,56 @@ export class Connection implements Established {
 					await this.#publisher.handleUnsubscribe(msg);
 				} else if (msg instanceof TrackStatusRequest) {
 					await this.#publisher.handleTrackStatusRequest(msg);
-				} else if (msg instanceof AnnounceOk) {
-					await this.#publisher.handleAnnounceOk(msg);
-				} else if (msg instanceof AnnounceError) {
-					await this.#publisher.handleAnnounceError(msg);
-				} else if (msg instanceof AnnounceCancel) {
-					await this.#publisher.handleAnnounceCancel(msg);
-					// Messages sent by Publisher, received by Subscriber:
-				} else if (msg instanceof Announce) {
-					await this.#subscriber.handleAnnounce(msg);
-				} else if (msg instanceof Unannounce) {
-					await this.#subscriber.handleUnannounce(msg);
+				} else if (msg instanceof PublishNamespaceOk) {
+					await this.#publisher.handlePublishNamespaceOk(msg);
+				} else if (msg instanceof PublishNamespaceError) {
+					await this.#publisher.handlePublishNamespaceError(msg);
+				} else if (msg instanceof PublishNamespaceCancel) {
+					await this.#publisher.handlePublishNamespaceCancel(msg);
+				} else if (msg instanceof PublishNamespace) {
+					await this.#subscriber.handlePublishNamespace(msg);
+				} else if (msg instanceof PublishNamespaceDone) {
+					await this.#subscriber.handlePublishNamespaceDone(msg);
 				} else if (msg instanceof SubscribeOk) {
 					await this.#subscriber.handleSubscribeOk(msg);
 				} else if (msg instanceof SubscribeError) {
 					await this.#subscriber.handleSubscribeError(msg);
-				} else if (msg instanceof SubscribeDone) {
-					await this.#subscriber.handleSubscribeDone(msg);
+				} else if (msg instanceof PublishDone) {
+					await this.#subscriber.handlePublishDone(msg);
 				} else if (msg instanceof TrackStatus) {
 					await this.#subscriber.handleTrackStatus(msg);
-					// Other messages:
 				} else if (msg instanceof GoAway) {
 					await this.#handleGoAway(msg);
-				} else if (msg instanceof Setup.Client) {
+				} else if (msg instanceof Setup.ClientSetup) {
 					await this.#handleClientSetup(msg);
-				} else if (msg instanceof Setup.Server) {
+				} else if (msg instanceof Setup.ServerSetup) {
 					await this.#handleServerSetup(msg);
-				} else if (msg instanceof SubscribeAnnounces) {
-					await this.#publisher.handleSubscribeAnnounces(msg);
-				} else if (msg instanceof SubscribeAnnouncesOk) {
-					await this.#subscriber.handleSubscribeAnnouncesOk(msg);
-				} else if (msg instanceof SubscribeAnnouncesError) {
-					await this.#subscriber.handleSubscribeAnnouncesError(msg);
-				} else if (msg instanceof UnsubscribeAnnounces) {
-					await this.#publisher.handleUnsubscribeAnnounces(msg);
+				} else if (msg instanceof SubscribeNamespace) {
+					await this.#publisher.handleSubscribeNamespace(msg);
+				} else if (msg instanceof SubscribeNamespaceOk) {
+					await this.#subscriber.handleSubscribeNamespaceOk(msg);
+				} else if (msg instanceof SubscribeNamespaceError) {
+					await this.#subscriber.handleSubscribeNamespaceError(msg);
+				} else if (msg instanceof UnsubscribeNamespace) {
+					await this.#publisher.handleUnsubscribeNamespace(msg);
+				} else if (msg instanceof Publish) {
+					await this.#subscriber.handlePublish(msg);
+				} else if (msg instanceof PublishOk) {
+					throw new Error("PUBLISH_OK messages are not supported");
+				} else if (msg instanceof PublishError) {
+					throw new Error("PUBLISH_ERROR messages are not supported");
 				} else if (msg instanceof Fetch) {
-					// no
+					throw new Error("FETCH messages are not supported");
 				} else if (msg instanceof FetchOk) {
-					// no
+					throw new Error("FETCH_OK messages are not supported");
 				} else if (msg instanceof FetchError) {
-					// no
-					// } else if (msg instanceof FetchCancel) {
-					// For some reason Typescript doesn't like FetchCancel?
+					throw new Error("FETCH_ERROR messages are not supported");
+				} else if (msg instanceof FetchCancel) {
+					throw new Error("FETCH_CANCEL messages are not supported");
+				} else if (msg instanceof MaxRequestId) {
+					this.#control.maxRequestId(msg.requestId);
+				} else if (msg instanceof RequestsBlocked) {
+					console.warn("ignoring REQUESTS_BLOCKED message");
 				} else {
 					unreachable(msg);
 				}
@@ -200,7 +230,7 @@ export class Connection implements Established {
 	 * Handles an unexpected CLIENT_SETUP control message.
 	 * @param msg - The CLIENT_SETUP message
 	 */
-	async #handleClientSetup(_msg: Setup.Client) {
+	async #handleClientSetup(_msg: Setup.ClientSetup) {
 		console.error("Unexpected CLIENT_SETUP message received after connection established");
 		this.close();
 	}
@@ -209,7 +239,7 @@ export class Connection implements Established {
 	 * Handles an unexpected SERVER_SETUP control message.
 	 * @param msg - The SERVER_SETUP message
 	 */
-	async #handleServerSetup(_msg: Setup.Server) {
+	async #handleServerSetup(_msg: Setup.ServerSetup) {
 		console.error("Unexpected SERVER_SETUP message received after connection established");
 		this.close();
 	}
@@ -241,9 +271,9 @@ export class Connection implements Established {
 	 */
 	async #runObjectStream(stream: Reader) {
 		try {
-			await readStreamType(stream);
-
-			const header = await GroupMessage.decode(stream);
+			// we don't support other stream types yet
+			const header = await Group.decode(stream);
+			console.debug("received group header", header);
 			await this.#subscriber.handleGroup(header, stream);
 		} catch (err) {
 			console.error("error processing object stream", err);

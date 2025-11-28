@@ -68,8 +68,8 @@ leaf:
 	cd rs && just leaf
 
 # Publish a video using ffmpeg to the localhost relay server
-pub name url='http://localhost:4443/anon':
-	cd rs && just pub {{name}} {{url}}
+pub name url='http://localhost:4443/anon' *args:
+	cd rs && just pub {{name}} {{url}} {{args}}
 
 # Publish/subscribe using gstreamer - see https://github.com/kixelated/hang-gst
 pub-gst name url='http://localhost:4443/anon':
@@ -91,8 +91,8 @@ web url='http://localhost:4443/anon':
 
 # Publish the clock broadcast
 # `action` is either `publish` or `subscribe`
-clock action:
-	cd rs && just clock {{action}}
+clock action url="http://localhost:4443/anon" *args:
+	cd rs && just clock {{action}} {{url}} {{args}}
 
 # Run the CI checks
 check:

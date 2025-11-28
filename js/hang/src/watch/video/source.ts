@@ -5,11 +5,9 @@ import * as Frame from "../../frame";
 import { PRIORITY } from "../../publish/priority";
 import * as Time from "../../time";
 import * as Hex from "../../util/hex";
-import { Detection, type DetectionProps } from "./detection";
 
 export type SourceProps = {
 	enabled?: boolean | Signal<boolean>;
-	detection?: DetectionProps;
 
 	// Jitter buffer size in milliseconds (default: 100ms)
 	// When using b-frames, this should to be larger than the frame duration.
@@ -28,8 +26,17 @@ export type Target = {
 // This way we can keep the current subscription active.
 type RequiredDecoderConfig = Omit<Catalog.VideoConfig, "codedWidth" | "codedHeight">;
 
+type BufferStatus = { state: "empty" | "filled" };
+
+type SyncStatus = {
+	state: "ready" | "wait";
+	bufferDuration?: number;
+};
+
 // Responsible for switching between video tracks and buffering frames.
 export class Source {
+	#MIN_SYNC_WAIT_MS = 50 as Time.Milli;
+
 	broadcast: Signal<Moq.Broadcast | undefined>;
 	enabled: Signal<boolean>; // Don't download any longer
 
@@ -48,8 +55,6 @@ export class Source {
 	// The current track running, held so we can cancel it when the new track is ready.
 	#pending?: Effect;
 	#active?: Effect;
-
-	detection: Detection;
 
 	// Used as a tiebreaker when there are multiple tracks (HD vs SD).
 	target = new Signal<Target | undefined>(undefined);
@@ -74,6 +79,10 @@ export class Source {
 	// The latency after we've accounted for the extra frame buffering and jitter buffer.
 	#jitter: Signal<Time.Milli>;
 
+	bufferStatus = new Signal<BufferStatus>({ state: "empty" });
+
+	syncStatus = new Signal<SyncStatus>({ state: "ready" });
+
 	#signals = new Effect();
 
 	constructor(
@@ -84,7 +93,6 @@ export class Source {
 		this.broadcast = broadcast;
 		this.latency = Signal.from(props?.latency ?? (100 as Time.Milli));
 		this.enabled = Signal.from(props?.enabled ?? false);
-		this.detection = new Detection(this.broadcast, this.catalog, props?.detection);
 
 		// We subtract a frame from the jitter buffer to account for the extra buffered frame.
 		// Assume 30fps by default.
@@ -101,6 +109,7 @@ export class Source {
 		this.#signals.effect(this.#runPending.bind(this));
 		this.#signals.effect(this.#runDisplay.bind(this));
 		this.#signals.effect(this.#runJitter.bind(this));
+		this.#signals.effect(this.#runBuffer.bind(this));
 	}
 
 	#runSupported(effect: Effect): void {
@@ -118,6 +127,10 @@ export class Source {
 					optimizeForLatency: rendition.optimizeForLatency ?? true,
 				});
 				if (valid) supported[name] = rendition;
+			}
+
+			if (Object.keys(supported).length === 0 && Object.keys(renditions).length > 0) {
+				console.warn("no supported renditions found, available: ", renditions);
 			}
 
 			this.#supported.set(supported);
@@ -266,8 +279,22 @@ export class Source {
 					this.#reference = ref;
 				} else {
 					const sleep = this.#reference - ref + this.#jitter.peek();
+					const isWaitRequired = sleep >= this.#MIN_SYNC_WAIT_MS;
 					if (sleep > 0) {
+						// The planned jitter buffer size
+						const bufferDuration: Time.Milli = this.#jitter.peek();
+
+						if (isWaitRequired) {
+							this.syncStatus.set({ state: "wait", bufferDuration });
+						}
+
 						await new Promise((resolve) => setTimeout(resolve, sleep));
+
+						if (isWaitRequired) {
+							this.syncStatus.set({ state: "ready", bufferDuration });
+						}
+					} else {
+						this.syncStatus.set({ state: "ready" });
 					}
 				}
 
@@ -345,6 +372,20 @@ export class Source {
 		});
 	}
 
+	#runBuffer(effect: Effect): void {
+		const currentFrame = effect.get(this.frame);
+		const nextFrame = this.#next;
+		const enabled = effect.get(this.enabled);
+
+		const isBufferEmpty = enabled && !currentFrame && !nextFrame;
+
+		if (isBufferEmpty) {
+			this.bufferStatus.set({ state: "empty" });
+		} else {
+			this.bufferStatus.set({ state: "filled" });
+		}
+	}
+
 	#runJitter(effect: Effect): void {
 		const config = effect.get(this.#selectedConfig);
 		if (!config) return;
@@ -375,6 +416,5 @@ export class Source {
 		this.#next = undefined;
 
 		this.#signals.close();
-		this.detection.close();
 	}
 }

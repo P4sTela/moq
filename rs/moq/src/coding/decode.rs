@@ -1,8 +1,8 @@
 use std::{borrow::Cow, string::FromUtf8Error};
 use thiserror::Error;
 
-pub trait Decode: Sized {
-	fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError>;
+pub trait Decode<V>: Sized {
+	fn decode<B: bytes::Buf>(buf: &mut B, version: V) -> Result<Self, DecodeError>;
 }
 
 /// A decode error.
@@ -10,6 +10,9 @@ pub trait Decode: Sized {
 pub enum DecodeError {
 	#[error("short buffer")]
 	Short,
+
+	#[error("long buffer")]
+	Long,
 
 	#[error("invalid string")]
 	InvalidString(#[from] FromUtf8Error),
@@ -23,6 +26,9 @@ pub enum DecodeError {
 	#[error("invalid value")]
 	InvalidValue,
 
+	#[error("too many")]
+	TooMany,
+
 	#[error("bounds exceeded")]
 	BoundsExceeded,
 
@@ -32,22 +38,28 @@ pub enum DecodeError {
 	#[error("expected data")]
 	ExpectedData,
 
-	#[error("too many bytes")]
-	TooManyBytes,
+	#[error("duplicate")]
+	Duplicate,
 
-	// TODO move these to ParamError
-	#[error("duplicate parameter")]
-	DupliateParameter,
+	#[error("missing")]
+	Missing,
 
-	#[error("missing parameter")]
-	MissingParameter,
-
-	#[error("invalid parameter")]
-	InvalidParameter,
+	#[error("unsupported")]
+	Unsupported,
 }
 
-impl Decode for u8 {
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+impl<V> Decode<V> for bool {
+	fn decode<R: bytes::Buf>(r: &mut R, version: V) -> Result<Self, DecodeError> {
+		match u8::decode(r, version)? {
+			0 => Ok(false),
+			1 => Ok(true),
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl<V> Decode<V> for u8 {
+	fn decode<R: bytes::Buf>(r: &mut R, _: V) -> Result<Self, DecodeError> {
 		match r.has_remaining() {
 			true => Ok(r.get_u8()),
 			false => Err(DecodeError::Short),
@@ -55,19 +67,28 @@ impl Decode for u8 {
 	}
 }
 
-impl Decode for String {
+impl<V> Decode<V> for u16 {
+	fn decode<R: bytes::Buf>(r: &mut R, _: V) -> Result<Self, DecodeError> {
+		match r.remaining() >= 2 {
+			true => Ok(r.get_u16()),
+			false => Err(DecodeError::Short),
+		}
+	}
+}
+
+impl<V> Decode<V> for String {
 	/// Decode a string with a varint length prefix.
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let v = Vec::<u8>::decode(r)?;
+	fn decode<R: bytes::Buf>(r: &mut R, version: V) -> Result<Self, DecodeError> {
+		let v = Vec::<u8>::decode(r, version)?;
 		let str = String::from_utf8(v)?;
 
 		Ok(str)
 	}
 }
 
-impl Decode for Vec<u8> {
-	fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-		let size = usize::decode(buf)?;
+impl<V> Decode<V> for Vec<u8> {
+	fn decode<B: bytes::Buf>(buf: &mut B, version: V) -> Result<Self, DecodeError> {
+		let size = usize::decode(buf, version)?;
 
 		if buf.remaining() < size {
 			return Err(DecodeError::Short);
@@ -78,15 +99,8 @@ impl Decode for Vec<u8> {
 	}
 }
 
-impl Decode for std::time::Duration {
-	fn decode<B: bytes::Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-		let ms = u64::decode(buf)?;
-		Ok(std::time::Duration::from_micros(ms))
-	}
-}
-
-impl Decode for i8 {
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+impl<V> Decode<V> for i8 {
+	fn decode<R: bytes::Buf>(r: &mut R, _: V) -> Result<Self, DecodeError> {
 		if !r.has_remaining() {
 			return Err(DecodeError::Short);
 		}
@@ -98,9 +112,9 @@ impl Decode for i8 {
 	}
 }
 
-impl Decode for bytes::Bytes {
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let len = usize::decode(r)?;
+impl<V> Decode<V> for bytes::Bytes {
+	fn decode<R: bytes::Buf>(r: &mut R, version: V) -> Result<Self, DecodeError> {
+		let len = usize::decode(r, version)?;
 		if r.remaining() < len {
 			return Err(DecodeError::Short);
 		}
@@ -110,9 +124,9 @@ impl Decode for bytes::Bytes {
 }
 
 // TODO Support borrowed strings.
-impl<'a> Decode for Cow<'a, str> {
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let s = String::decode(r)?;
+impl<'a, V> Decode<V> for Cow<'a, str> {
+	fn decode<R: bytes::Buf>(r: &mut R, version: V) -> Result<Self, DecodeError> {
+		let s = String::decode(r, version)?;
 		Ok(Cow::Owned(s))
 	}
 }

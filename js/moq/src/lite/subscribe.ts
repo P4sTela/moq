@@ -1,5 +1,7 @@
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import * as Message from "./message.ts";
+import { Version } from "./version.ts";
 
 export class SubscribeUpdate {
 	priority: number;
@@ -18,16 +20,15 @@ export class SubscribeUpdate {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<SubscribeUpdate> {
-		return r.message(SubscribeUpdate.#decode);
+		return Message.decode(r, SubscribeUpdate.#decode);
 	}
 
 	static async decodeMaybe(r: Reader): Promise<SubscribeUpdate | undefined> {
-		if (await r.done()) return;
-		return SubscribeUpdate.decode(r);
+		return Message.decodeMaybe(r, SubscribeUpdate.#decode);
 	}
 }
 
@@ -60,35 +61,54 @@ export class Subscribe {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<Subscribe> {
-		return r.message(Subscribe.#decode);
+		return Message.decode(r, Subscribe.#decode);
 	}
 }
 
 export class SubscribeOk {
-	priority: number;
+	// The version
+	readonly version: Version;
+	priority?: number;
 
-	constructor(priority: number) {
+	constructor({ version, priority = undefined }: { version: Version; priority?: number }) {
+		this.version = version;
 		this.priority = priority;
 	}
 
 	async #encode(w: Writer) {
-		await w.u8(this.priority);
+		if (this.version === Version.DRAFT_02) {
+			// noop
+		} else if (this.version === Version.DRAFT_01) {
+			await w.u8(this.priority ?? 0);
+		} else {
+			const version: never = this.version;
+			throw new Error(`unsupported version: ${version}`);
+		}
 	}
 
-	static async #decode(r: Reader): Promise<SubscribeOk> {
-		const priority = await r.u8();
-		return new SubscribeOk(priority);
+	static async #decode(version: Version, r: Reader): Promise<SubscribeOk> {
+		let priority: number | undefined;
+		if (version === Version.DRAFT_02) {
+			// noop
+		} else if (version === Version.DRAFT_01) {
+			priority = await r.u8();
+		} else {
+			const v: never = version;
+			throw new Error(`unsupported version: ${v}`);
+		}
+
+		return new SubscribeOk({ version, priority });
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
-	static async decode(r: Reader): Promise<SubscribeOk> {
-		return r.message(SubscribeOk.#decode);
+	static async decode(r: Reader, version: Version): Promise<SubscribeOk> {
+		return Message.decode(r, SubscribeOk.#decode.bind(SubscribeOk, version));
 	}
 }

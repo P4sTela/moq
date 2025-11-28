@@ -1,20 +1,5 @@
 import type { Reader, Writer } from "../stream.ts";
-
-export const Version = {
-	DRAFT_00: 0xff000000,
-	DRAFT_01: 0xff000001,
-	DRAFT_02: 0xff000002,
-	DRAFT_03: 0xff000003,
-	FORK_00: 0xff0bad00,
-	FORK_01: 0xff0bad01,
-	FORK_02: 0xff0bad02,
-	FORK_03: 0xff0bad03,
-	FORK_04: 0xff0bad04,
-	LITE_00: 0xff0dad00,
-	LITE_01: 0xff0dad01,
-} as const;
-
-export const CURRENT_VERSION = Version.LITE_01;
+import * as Message from "./message.ts";
 
 export class Extensions {
 	entries: Map<bigint, Uint8Array>;
@@ -96,11 +81,11 @@ export class SessionClient {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<SessionClient> {
-		return r.message(SessionClient.#decode);
+		return Message.decode(r, SessionClient.#decode);
 	}
 }
 
@@ -125,11 +110,11 @@ export class SessionServer {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<SessionServer> {
-		return r.message(SessionServer.#decode);
+		return Message.decode(r, SessionServer.#decode);
 	}
 }
 
@@ -150,15 +135,14 @@ export class SessionInfo {
 	}
 
 	async encode(w: Writer): Promise<void> {
-		return w.message(this.#encode.bind(this));
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
 	static async decode(r: Reader): Promise<SessionInfo> {
-		return r.message(SessionInfo.#decode);
+		return Message.decode(r, SessionInfo.#decode);
 	}
 
 	static async decodeMaybe(r: Reader): Promise<SessionInfo | undefined> {
-		if (await r.done()) return;
-		return await SessionInfo.decode(r);
+		return Message.decodeMaybe(r, SessionInfo.#decode);
 	}
 }

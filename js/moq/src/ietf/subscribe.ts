@@ -1,9 +1,8 @@
 import type * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import * as Message from "./message.ts";
 import * as Namespace from "./namespace.ts";
-
-// We only support Latest Group (0x1)
-const FILTER_TYPE = 0x01;
+import { Parameters } from "./parameters.ts";
 
 // we only support Group Order descending
 const GROUP_ORDER = 0x02;
@@ -11,204 +10,174 @@ const GROUP_ORDER = 0x02;
 export class Subscribe {
 	static id = 0x03;
 
-	subscribeId: bigint;
-	trackAlias: bigint;
+	requestId: bigint;
 	trackNamespace: Path.Valid;
 	trackName: string;
 	subscriberPriority: number;
 
-	constructor(
-		subscribeId: bigint,
-		trackAlias: bigint,
-		trackNamespace: Path.Valid,
-		trackName: string, // technically bytes, but we're using strings for now
-		subscriberPriority: number,
-	) {
-		this.subscribeId = subscribeId;
-		this.trackAlias = trackAlias;
+	constructor(requestId: bigint, trackNamespace: Path.Valid, trackName: string, subscriberPriority: number) {
+		this.requestId = requestId;
 		this.trackNamespace = trackNamespace;
 		this.trackName = trackName;
 		this.subscriberPriority = subscriberPriority;
 	}
 
-	async encodeMessage(w: Writer): Promise<void> {
-		await w.u62(this.subscribeId);
-		await w.u62(this.trackAlias);
+	async #encode(w: Writer): Promise<void> {
+		await w.u62(this.requestId);
 		await Namespace.encode(w, this.trackNamespace);
 		await w.string(this.trackName);
 		await w.u8(this.subscriberPriority);
 		await w.u8(GROUP_ORDER);
-		await w.u8(FILTER_TYPE);
-		await w.u8(0); // no parameters
+		await w.bool(true); // forward = true
+		await w.u53(0x2); // filter type = LargestObject
+		await w.u53(0); // no parameters
 	}
 
-	static async decodeMessage(r: Reader): Promise<Subscribe> {
-		const subscribeId = await r.u62();
-		const trackAlias = await r.u62();
+	async encode(w: Writer): Promise<void> {
+		return Message.encode(w, this.#encode.bind(this));
+	}
+
+	static async decode(r: Reader): Promise<Subscribe> {
+		return Message.decode(r, Subscribe.#decode);
+	}
+
+	static async #decode(r: Reader): Promise<Subscribe> {
+		const requestId = await r.u62();
 		const trackNamespace = await Namespace.decode(r);
 		const trackName = await r.string();
 		const subscriberPriority = await r.u8();
 
 		const groupOrder = await r.u8();
-		if (groupOrder !== 0 && groupOrder !== GROUP_ORDER) {
-			throw new Error(`unsupported group order: ${groupOrder}`);
+		if (groupOrder > 2) {
+			throw new Error(`unknown group order: ${groupOrder}`);
 		}
 
-		const filterType = await r.u8();
-		if (filterType !== FILTER_TYPE) {
+		const forward = await r.bool();
+		if (!forward) {
+			throw new Error(`unsupported forward value: ${forward}`);
+		}
+
+		const filterType = await r.u53();
+		if (filterType !== 0x1 && filterType !== 0x2) {
 			throw new Error(`unsupported filter type: ${filterType}`);
 		}
 
-		const numParams = await r.u8();
-		if (numParams !== 0) {
-			throw new Error(`SUBSCRIBE: parameters not supported: ${numParams}`);
-		}
+		await Parameters.decode(r); // ignore parameters
 
-		return new Subscribe(subscribeId, trackAlias, trackNamespace, trackName, subscriberPriority);
+		return new Subscribe(requestId, trackNamespace, trackName, subscriberPriority);
 	}
 }
 
 export class SubscribeOk {
 	static id = 0x04;
 
-	subscribeId: bigint;
+	requestId: bigint;
+	trackAlias: bigint;
 
-	// Largest group/object ID
-	largest?: [bigint, bigint];
-
-	constructor(subscribeId: bigint, largest?: [bigint, bigint]) {
-		this.subscribeId = subscribeId;
-		this.largest = largest;
+	constructor(requestId: bigint, trackAlias: bigint) {
+		this.requestId = requestId;
+		this.trackAlias = trackAlias;
 	}
 
-	async encodeMessage(w: Writer): Promise<void> {
-		await w.u62(this.subscribeId);
-		await w.u8(0);
+	async #encode(w: Writer): Promise<void> {
+		await w.u62(this.requestId);
+		await w.u62(this.trackAlias);
+		await w.u62(0n); // expires = 0
 		await w.u8(GROUP_ORDER);
-		if (this.largest) {
-			await w.u8(1);
-			await w.u62(this.largest[0]);
-			await w.u62(this.largest[1]);
-		} else {
-			await w.u8(0);
-		}
-		await w.u8(0); // no parameters
+		await w.bool(false); // content exists = false
+		await w.u53(0); // no parameters
 	}
 
-	static async decodeMessage(r: Reader): Promise<SubscribeOk> {
-		const subscribeId = await r.u62();
+	async encode(w: Writer): Promise<void> {
+		return Message.encode(w, this.#encode.bind(this));
+	}
 
-		const expires = await r.u53();
-		if (expires !== 0) {
+	static async decode(r: Reader): Promise<SubscribeOk> {
+		return Message.decode(r, SubscribeOk.#decode);
+	}
+
+	static async #decode(r: Reader): Promise<SubscribeOk> {
+		const requestId = await r.u62();
+		const trackAlias = await r.u62();
+		const expires = await r.u62();
+		if (expires !== BigInt(0)) {
 			throw new Error(`unsupported expires: ${expires}`);
 		}
 
 		await r.u8(); // Don't care about group order
 
-		let largest: [bigint, bigint] | undefined;
-		const contentExists = await r.u8();
-		if (contentExists === 1) {
-			largest = [await r.u62(), await r.u62()];
+		const contentExists = await r.bool();
+		if (contentExists) {
+			// Ignore largest group/object
+			await r.u62();
+			await r.u62();
 		}
 
-		const numParams = await r.u8();
-		if (numParams !== 0) {
-			throw new Error(`SUBSCRIBE_OK: parameters not supported: ${numParams}`);
-		}
+		await Parameters.decode(r); // ignore parameters
 
-		return new SubscribeOk(subscribeId, largest);
+		return new SubscribeOk(requestId, trackAlias);
 	}
 }
 
 export class SubscribeError {
 	static id = 0x05;
 
-	subscribeId: bigint;
+	requestId: bigint;
 	errorCode: number;
 	reasonPhrase: string;
-	trackAlias: bigint;
 
-	constructor(subscribeId: bigint, errorCode: number, reasonPhrase: string, trackAlias: bigint) {
-		this.subscribeId = subscribeId;
+	constructor(requestId: bigint, errorCode: number, reasonPhrase: string) {
+		this.requestId = requestId;
 		this.errorCode = errorCode;
 		this.reasonPhrase = reasonPhrase;
-		this.trackAlias = trackAlias;
 	}
 
-	async encodeMessage(w: Writer): Promise<void> {
-		await w.u62(this.subscribeId);
+	async #encode(w: Writer): Promise<void> {
+		await w.u62(this.requestId);
 		await w.u62(BigInt(this.errorCode));
 		await w.string(this.reasonPhrase);
-		await w.u62(this.trackAlias);
 	}
 
-	static async decodeMessage(r: Reader): Promise<SubscribeError> {
-		const subscribeId = await r.u62();
+	async encode(w: Writer): Promise<void> {
+		return Message.encode(w, this.#encode.bind(this));
+	}
+
+	static async decode(r: Reader): Promise<SubscribeError> {
+		return Message.decode(r, SubscribeError.#decode);
+	}
+
+	static async #decode(r: Reader): Promise<SubscribeError> {
+		const requestId = await r.u62();
 		const errorCode = Number(await r.u62());
 		const reasonPhrase = await r.string();
-		const trackAlias = await r.u62();
 
-		return new SubscribeError(subscribeId, errorCode, reasonPhrase, trackAlias);
+		return new SubscribeError(requestId, errorCode, reasonPhrase);
 	}
 }
 
 export class Unsubscribe {
 	static readonly id = 0x0a;
 
-	subscribeId: bigint;
+	requestId: bigint;
 
-	constructor(subscribeId: bigint) {
-		this.subscribeId = subscribeId;
+	constructor(requestId: bigint) {
+		this.requestId = requestId;
 	}
 
-	async encodeMessage(w: Writer): Promise<void> {
-		await w.u62(this.subscribeId);
+	async #encode(w: Writer): Promise<void> {
+		await w.u62(this.requestId);
 	}
 
-	static async decodeMessage(r: Reader): Promise<Unsubscribe> {
-		const subscribeId = await r.u62();
-		return new Unsubscribe(subscribeId);
-	}
-}
-
-export class SubscribeDone {
-	static readonly id = 0x0b;
-
-	subscribeId: bigint;
-	statusCode: number;
-	reasonPhrase: string;
-	final?: [bigint, bigint];
-
-	constructor(subscribeId: bigint, statusCode: number, reasonPhrase: string, final?: [bigint, bigint]) {
-		this.subscribeId = subscribeId;
-		this.statusCode = statusCode;
-		this.reasonPhrase = reasonPhrase;
-		this.final = final;
+	async encode(w: Writer): Promise<void> {
+		return Message.encode(w, this.#encode.bind(this));
 	}
 
-	async encodeMessage(w: Writer): Promise<void> {
-		await w.u62(this.subscribeId);
-		await w.u62(BigInt(this.statusCode));
-		await w.string(this.reasonPhrase);
-		if (this.final) {
-			await w.u8(1);
-			await w.u62(this.final[0]);
-			await w.u62(this.final[1]);
-		} else {
-			await w.u8(0);
-		}
+	static async decode(r: Reader): Promise<Unsubscribe> {
+		return Message.decode(r, Unsubscribe.#decode);
 	}
 
-	static async decodeMessage(r: Reader): Promise<SubscribeDone> {
-		const subscribeId = await r.u62();
-		const statusCode = Number(await r.u62());
-		const reasonPhrase = await r.string();
-		const contentExists = await r.u53();
-		let final: [bigint, bigint] | undefined;
-		if (contentExists === 1) {
-			final = [await r.u62(), await r.u62()];
-		}
-
-		return new SubscribeDone(subscribeId, statusCode, reasonPhrase, final);
+	static async #decode(r: Reader): Promise<Unsubscribe> {
+		const requestId = await r.u62();
+		return new Unsubscribe(requestId);
 	}
 }

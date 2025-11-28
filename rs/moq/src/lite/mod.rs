@@ -1,19 +1,26 @@
 mod announce;
 mod group;
 mod info;
+mod message;
+mod parameters;
+mod priority;
 mod publisher;
 mod session;
 mod setup;
 mod stream;
 mod subscribe;
 mod subscriber;
+mod version;
 
 pub use announce::*;
 pub use group::*;
 pub use info::*;
+pub use message::*;
+pub use parameters::*;
 use publisher::*;
-pub(crate) use session::*;
+pub(super) use session::*;
 pub use setup::*;
 pub use stream::*;
 pub use subscribe::*;
 use subscriber::*;
+pub use version::*;

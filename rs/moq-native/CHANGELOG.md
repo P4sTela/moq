@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/kixelated/moq/compare/moq-native-v0.9.6...moq-native-v0.10.0) - 2025-11-26
+
+### Other
+
+- Upgrade web-transport ([#680](https://github.com/kixelated/moq/pull/680))
+- Add moqt:// support. ([#659](https://github.com/kixelated/moq/pull/659))
+- Allow --tls-disable-verify without false. ([#648](https://github.com/kixelated/moq/pull/648))
+
+## [0.9.0](https://github.com/kixelated/moq/compare/moq-native-v0.8.4...moq-native-v0.9.0) - 2025-10-25
+
+### Other
+
+- Fix an arg collision with --tls-root and --cluster-root ([#637](https://github.com/kixelated/moq/pull/637))
+
 ## [0.8.4](https://github.com/kixelated/moq/compare/moq-native-v0.8.3...moq-native-v0.8.4) - 2025-10-18
 
 ### Other

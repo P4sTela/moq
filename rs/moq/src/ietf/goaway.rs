@@ -1,8 +1,11 @@
-//! IETF moq-transport-07 goaway message
+//! IETF moq-transport-14 goaway message
 
 use std::borrow::Cow;
 
-use crate::coding::*;
+use crate::{
+	coding::*,
+	ietf::{Message, Version},
+};
 
 /// GoAway message (0x10)
 #[derive(Clone, Debug)]
@@ -11,12 +14,14 @@ pub struct GoAway<'a> {
 }
 
 impl<'a> Message for GoAway<'a> {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W) {
-		self.new_session_uri.encode(w);
+	const ID: u64 = 0x10;
+
+	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) {
+		self.new_session_uri.encode(w, version);
 	}
 
-	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-		let new_session_uri = Cow::<str>::decode(r)?;
+	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		let new_session_uri = Cow::<str>::decode(r, version)?;
 		Ok(Self { new_session_uri })
 	}
 }
@@ -28,13 +33,13 @@ mod tests {
 
 	fn encode_message<M: Message>(msg: &M) -> Vec<u8> {
 		let mut buf = BytesMut::new();
-		msg.encode(&mut buf);
+		msg.encode_msg(&mut buf, Version::Draft14);
 		buf.to_vec()
 	}
 
 	fn decode_message<M: Message>(bytes: &[u8]) -> Result<M, DecodeError> {
 		let mut buf = bytes::Bytes::from(bytes.to_vec());
-		M::decode(&mut buf)
+		M::decode_msg(&mut buf, Version::Draft14)
 	}
 
 	#[test]
