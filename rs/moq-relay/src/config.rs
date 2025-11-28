@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthConfig, ClusterConfig, WebConfig};
+use crate::{AuthConfig, CachePolicyConfig, ClusterConfig, WebConfig};
 
 #[derive(Parser, Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +34,11 @@ pub struct Config {
 	#[command(flatten)]
 	#[serde(default)]
 	pub web: WebConfig,
+
+	/// Cache policy configuration.
+	#[command(flatten)]
+	#[serde(default)]
+	pub cache_policy: CachePolicyConfig,
 
 	/// If provided, load the configuration from this file.
 	#[serde(default)]

@@ -1,10 +1,12 @@
 mod auth;
+mod cache_policy;
 mod cluster;
 mod config;
 mod connection;
 mod web;
 
 pub use auth::*;
+pub use cache_policy::*;
 pub use cluster::*;
 pub use config::*;
 pub use connection::*;

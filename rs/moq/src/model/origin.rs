@@ -1,12 +1,13 @@
 use std::{
 	collections::HashMap,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{atomic::{AtomicU64, Ordering}, Arc},
+	time::Instant,
 };
 use tokio::sync::mpsc;
 use web_async::Lock;
 
 use super::BroadcastConsumer;
-use crate::{AsPath, Path, PathOwned, Produce};
+use crate::{AsPath, CachePolicy, Path, PathOwned, Produce};
 
 static NEXT_CONSUMER_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -19,11 +20,17 @@ impl ConsumerId {
 	}
 }
 
+// Backup broadcast with timestamp for TTL management
+struct BackupBroadcast {
+	broadcast: BroadcastConsumer,
+	created_at: Instant,
+}
+
 // If there are multiple broadcasts with the same path, we use the most recent one but keep the others around.
 struct OriginBroadcast {
 	path: PathOwned,
 	active: BroadcastConsumer,
-	backup: Vec<BroadcastConsumer>,
+	backup: Vec<BackupBroadcast>,
 }
 
 #[derive(Clone)]
@@ -106,14 +113,18 @@ struct OriginNode {
 
 	// Unfortunately, to notify consumers we need to traverse back up the tree.
 	notify: Lock<NotifyNode>,
+
+	// Cache policy for managing backups
+	policy: Arc<dyn CachePolicy>,
 }
 
 impl OriginNode {
-	fn new(parent: Option<Lock<NotifyNode>>) -> Self {
+	fn new(parent: Option<Lock<NotifyNode>>, policy: Arc<dyn CachePolicy>) -> Self {
 		Self {
 			broadcast: None,
 			nested: HashMap::new(),
 			notify: Lock::new(NotifyNode::new(parent)),
+			policy,
 		}
 	}
 
@@ -132,7 +143,7 @@ impl OriginNode {
 		match self.nested.get(dir) {
 			Some(next) => next.clone(),
 			None => {
-				let next = Lock::new(OriginNode::new(Some(self.notify.clone())));
+				let next = Lock::new(OriginNode::new(Some(self.notify.clone()), self.policy.clone()));
 				self.nested.insert(dir.to_string(), next.clone());
 				next
 			}
@@ -151,7 +162,13 @@ impl OriginNode {
 			// This node is a leaf with an existing broadcast.
 			let old = existing.active.clone();
 			existing.active = broadcast.clone();
-			existing.backup.push(old);
+			existing.backup.push(BackupBroadcast {
+				broadcast: old,
+				created_at: Instant::now(),
+			});
+
+			// Cleanup old backups based on policy
+			self.cleanup_old_backups();
 
 			self.notify.lock().reannounce(full, broadcast);
 		} else {
@@ -221,7 +238,7 @@ impl OriginNode {
 			};
 
 			// See if we can remove the broadcast from the backup list.
-			let pos = entry.backup.iter().position(|b| b.is_clone(&broadcast));
+			let pos = entry.backup.iter().position(|b| b.broadcast.is_clone(&broadcast));
 			if let Some(pos) = pos {
 				entry.backup.remove(pos);
 				// Nothing else to do
@@ -232,8 +249,8 @@ impl OriginNode {
 			assert!(entry.active.is_clone(&broadcast));
 
 			// If there's a backup broadcast, then announce it.
-			if let Some(active) = entry.backup.pop() {
-				entry.active = active;
+			if let Some(backup) = entry.backup.pop() {
+				entry.active = backup.broadcast;
 				self.notify.lock().reannounce(full, &entry.active);
 			} else {
 				// No more backups, so remove the entry.
@@ -245,6 +262,24 @@ impl OriginNode {
 
 	fn is_empty(&self) -> bool {
 		self.broadcast.is_none() && self.nested.is_empty() && self.notify.lock().consumers.is_empty()
+	}
+
+	/// Cleanup old backup broadcasts based on cache policy
+	fn cleanup_old_backups(&mut self) {
+		if let Some(broadcast) = &mut self.broadcast {
+			let now = Instant::now();
+			let policy = self.policy.clone();
+			let mut backup_count = broadcast.backup.len();
+
+			broadcast.backup.retain(|b| {
+				let age_seconds = now.duration_since(b.created_at).as_secs();
+				let should_keep = policy.should_keep_backup(age_seconds, backup_count);
+				if !should_keep {
+					backup_count = backup_count.saturating_sub(1);
+				}
+				should_keep
+			});
+		}
 	}
 }
 
@@ -325,8 +360,10 @@ impl OriginNodes {
 
 impl Default for OriginNodes {
 	fn default() -> Self {
+		use crate::AlwaysCachePolicy;
+		let policy = Arc::new(AlwaysCachePolicy);
 		Self {
-			nodes: vec![("".into(), Lock::new(OriginNode::new(None)))],
+			nodes: vec![("".into(), Lock::new(OriginNode::new(None, policy)))],
 		}
 	}
 }
@@ -1320,5 +1357,103 @@ mod tests {
 
 		narrow_consumer.assert_next("worm-node/data", &broadcast1.consumer);
 		narrow_consumer.assert_next_wait(); // Should not see foobar
+	}
+
+	#[tokio::test]
+	async fn test_backup_cleanup_with_policy() {
+		use crate::PatternBasedCachePolicy;
+
+		// Test with policy that limits backups to 2
+		let policy = Arc::new(
+			PatternBasedCachePolicy::new()
+				.with_backup_max_count(2)
+		);
+		let root_node = Lock::new(OriginNode::new(None, policy));
+
+		let broadcast1 = Broadcast::produce();
+		let broadcast2 = Broadcast::produce();
+		let broadcast3 = Broadcast::produce();
+		let broadcast4 = Broadcast::produce();
+
+		// Publish 4 broadcasts to same path (using empty relative path)
+		root_node.lock().publish("test", &broadcast1.consumer, "");
+		root_node.lock().publish("test", &broadcast2.consumer, "");
+		root_node.lock().publish("test", &broadcast3.consumer, "");
+		root_node.lock().publish("test", &broadcast4.consumer, "");
+
+		// Check that only 2 backups are kept (max_backup_count = 2)
+		{
+			let node = root_node.lock();
+			let broadcast_state = node.broadcast.as_ref().unwrap();
+			assert_eq!(broadcast_state.backup.len(), 2, "Should only keep 2 backups");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_backup_ttl_cleanup() {
+		use crate::PatternBasedCachePolicy;
+		use std::time::Duration;
+
+		// Test with policy that limits backup age to 1 second
+		let policy = Arc::new(
+			PatternBasedCachePolicy::new()
+				.with_backup_max_age(1)
+		);
+		let root_node = Lock::new(OriginNode::new(None, policy));
+
+		let broadcast1 = Broadcast::produce();
+		let broadcast2 = Broadcast::produce();
+
+		// Publish first broadcast
+		root_node.lock().publish("test", &broadcast1.consumer, "");
+
+		// Publish second broadcast (broadcast1 becomes backup with timestamp)
+		root_node.lock().publish("test", &broadcast2.consumer, "");
+		// Now we have: active: broadcast2, backup: [broadcast1 with fresh timestamp]
+
+		// Wait 1.5 seconds for broadcast1 backup to age past 1 second TTL
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+
+		// Publish third broadcast - this should trigger cleanup removing old broadcast1 backup
+		let broadcast3 = Broadcast::produce();
+		root_node.lock().publish("test", &broadcast3.consumer, "");
+
+		// Check that old backup was removed
+		{
+			let node = root_node.lock();
+			let broadcast_state = node.broadcast.as_ref().unwrap();
+			// broadcast1 should be removed due to TTL (>1s old)
+			// Only broadcast2 backup should remain
+			assert_eq!(broadcast_state.backup.len(), 1, "Old backup should be removed by TTL");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_always_cache_policy_keeps_all_backups() {
+		use crate::AlwaysCachePolicy;
+
+		// Test with AlwaysCachePolicy (no limits)
+		let policy = Arc::new(AlwaysCachePolicy);
+		let root_node = Lock::new(OriginNode::new(None, policy));
+
+		let broadcast1 = Broadcast::produce();
+		let broadcast2 = Broadcast::produce();
+		let broadcast3 = Broadcast::produce();
+		let broadcast4 = Broadcast::produce();
+		let broadcast5 = Broadcast::produce();
+
+		// Publish 5 broadcasts (using empty relative path)
+		root_node.lock().publish("test", &broadcast1.consumer, "");
+		root_node.lock().publish("test", &broadcast2.consumer, "");
+		root_node.lock().publish("test", &broadcast3.consumer, "");
+		root_node.lock().publish("test", &broadcast4.consumer, "");
+		root_node.lock().publish("test", &broadcast5.consumer, "");
+
+		// All 4 backups should be kept (active is broadcast5)
+		{
+			let node = root_node.lock();
+			let broadcast_state = node.broadcast.as_ref().unwrap();
+			assert_eq!(broadcast_state.backup.len(), 4, "AlwaysCachePolicy should keep all backups");
+		}
 	}
 }
