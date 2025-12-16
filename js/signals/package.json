@@ -1,10 +1,10 @@
 {
-	"name": "@kixelated/signals",
+	"name": "@moq/signals",
 	"type": "module",
-	"version": "0.8.1",
+	"version": "0.1.0",
 	"description": "Reactive and safe signals",
 	"license": "(MIT OR Apache-2.0)",
-	"repository": "github:kixelated/moq",
+	"repository": "github:moq-dev/moq",
 	"exports": {
 		".": "./src/index.ts",
 		"./solid": "./src/solid.ts",
@@ -13,8 +13,7 @@
 	},
 	"scripts": {
 		"build": "rimraf dist && tsc -b && bun ../scripts/package.ts",
-		"check": "tsc --noEmit && biome check",
-		"fix": "biome check --fix",
+		"check": "tsc --noEmit",
 		"release": "bun ../scripts/release.ts"
 	},
 	"dependencies": {
@@ -22,7 +21,6 @@
 	},
 	"devDependencies": {
 		"typescript": "^5.9.2",
-		"@biomejs/biome": "^2.2.2",
 		"rimraf": "^6.0.1",
 		"@types/react": "^19.1.8",
 		"solid-js": "^1.9.7"

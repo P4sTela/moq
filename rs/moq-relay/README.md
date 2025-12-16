@@ -4,7 +4,7 @@
 It's designed to be run in a datacenter, relaying media across multiple hops to deduplicate and improve QoS.
 
 The only argument is the path to a TOML configuration file.
-See [dev.toml](cfg/dev.toml) for an example configuration.
+See [relay.toml](../dev/relay.toml) for an example configuration.
 
 ## HTTP
 Primarily for debugging, you can also connect to the relay via HTTP.
@@ -47,6 +47,7 @@ Key features:
 - Path-based authorization with `root`, `pub`, and `sub` claims
 - Anonymous access support for public content
 - Symmetric key cryptography (HMAC-SHA256/384/512)
+- Asymmetric key cryptography (RSASSA-PKCS1-SHA256/384/512, RSASSA-PSS-SHA256/384/512, ECDSA-SHA256/384, EdDSA)
 
 Quick example configuration in your `.toml` file:
 ```toml

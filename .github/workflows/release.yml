@@ -19,6 +19,8 @@ jobs:
     name: Plz
 
     runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'moq-dev' }}
+
     steps:
       # Generating a GitHub token, so that PRs and tags created by
       # the release-plz-action can trigger actions workflows.
@@ -45,10 +47,6 @@ jobs:
       # Run release-plz to create PRs and releases
       - name: Release-plz
         uses: MarcoIeni/release-plz-action@v0.5
-        with:
-          manifest_path: ./rs/Cargo.toml
-          config: ./rs/.release-plz.toml
-
         env:
           GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

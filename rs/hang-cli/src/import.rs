@@ -1,7 +1,6 @@
-use anyhow::Context;
 use clap::ValueEnum;
-use hang::moq_lite::BroadcastProducer;
-use tokio::io::AsyncRead;
+use hang::{moq_lite::coding::BytesMut, BroadcastProducer};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(ValueEnum, Clone)]
 pub enum ImportType {
@@ -9,34 +8,45 @@ pub enum ImportType {
 	Cmaf,
 }
 
-pub enum Import {
-	AnnexB(hang::annexb::Import),
-	Cmaf(Box<hang::cmaf::Import>),
+impl ImportType {
+	fn as_str(&self) -> &'static str {
+		match self {
+			ImportType::AnnexB => "annex-b",
+			ImportType::Cmaf => "cmaf",
+		}
+	}
+}
+
+pub struct Import {
+	decoder: hang::import::Decoder,
+	buffer: BytesMut,
 }
 
 impl Import {
 	pub fn new(broadcast: BroadcastProducer, format: ImportType) -> Self {
-		match format {
-			ImportType::AnnexB => Self::AnnexB(hang::annexb::Import::new(broadcast)),
-			ImportType::Cmaf => Self::Cmaf(Box::new(hang::cmaf::Import::new(broadcast))),
+		let decoder = hang::import::Decoder::new(broadcast, format.as_str()).expect("supported format");
+		Self {
+			decoder,
+			buffer: BytesMut::new(),
 		}
 	}
 }
 
 impl Import {
 	pub async fn init_from<T: AsyncRead + Unpin>(&mut self, input: &mut T) -> anyhow::Result<()> {
-		match self {
-			Self::AnnexB(_import) => {}
-			Self::Cmaf(import) => import.init_from(input).await.context("failed to parse CMAF headers")?,
-		};
+		while !self.decoder.is_initialized() && input.read_buf(&mut self.buffer).await? > 0 {
+			self.decoder.decode_stream(&mut self.buffer)?;
+		}
 
 		Ok(())
 	}
 
 	pub async fn read_from<T: AsyncRead + Unpin>(&mut self, input: &mut T) -> anyhow::Result<()> {
-		match self {
-			Self::AnnexB(import) => import.read_from(input).await.map_err(Into::into),
-			Self::Cmaf(import) => import.read_from(input).await.map_err(Into::into),
+		while input.read_buf(&mut self.buffer).await? > 0 {
+			self.decoder.decode_stream(&mut self.buffer)?;
 		}
+
+		// Flush the final frame.
+		self.decoder.decode_frame(&mut self.buffer, None)
 	}
 }

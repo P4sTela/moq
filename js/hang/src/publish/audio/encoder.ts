@@ -1,5 +1,5 @@
-import type * as Moq from "@kixelated/moq";
-import { Effect, type Getter, Signal } from "@kixelated/signals";
+import type * as Moq from "@moq/lite";
+import { Effect, type Getter, Signal } from "@moq/signals";
 import type * as Catalog from "../../catalog";
 import { u53 } from "../../catalog/integers";
 import * as Frame from "../../frame";
@@ -13,7 +13,7 @@ const GAIN_MIN = 0.001;
 const FADE_TIME = 0.2;
 
 // Unfortunately, we need to use a Vite-exclusive import for now.
-import CaptureWorklet from "./capture-worklet?worker&url";
+import CaptureWorklet from "./capture-worklet.ts?worker&url";
 
 // The initial values for our signals.
 export type EncoderProps = {
