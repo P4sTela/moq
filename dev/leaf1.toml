@@ -1,0 +1,21 @@
+[log]
+level = "trace"
+
+[server]
+listen = "[::]:4444"
+tls.generate = ["localhost"]
+
+[web.http]
+listen = "[::]:8081"
+
+[cluster]
+connect = "localhost:4443"
+token = "dev/root.jwt"
+node = "localhost:4444"
+
+[client.tls]
+disable_verify = true
+
+[auth]
+key = "dev/root.jwk"
+public = "anon"
