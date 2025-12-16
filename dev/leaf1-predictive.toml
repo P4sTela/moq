@@ -1,0 +1,37 @@
+# Leaf1 configuration with Predictive Cache enabled
+
+[server]
+listen = "[::]:4444"
+
+# Generate self-signed certificate for localhost
+tls.generate = ["localhost"]
+
+[web.http]
+# Listen for HTTP API on the same port as QUIC
+listen = "[::]:4444"
+
+[cluster]
+# Connect to Root
+connect = "localhost:4443"
+token = "dev/root.jwt"
+
+# Advertise ourselves to Root
+node = "localhost:4444"
+
+# Predictive cache configuration
+[cluster.predictive_cache]
+enabled = true
+prefetch_patterns = ["live/**", "sports/**", "moq-clock"]
+lookahead_seconds = 0  # Unlimited
+max_cache_bytes = 104857600  # 100MB
+ttl_seconds = 3600  # 1 hour
+
+[client.tls]
+disable_verify = true
+
+[auth]
+# Use the same key as Root for consistency
+key = "dev/root.jwk"
+
+# Allow anonymous access for testing
+public = "anon"
