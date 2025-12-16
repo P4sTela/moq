@@ -14,6 +14,7 @@
 //!
 //! While designed for media, the transport is generic and can handle any live data streams.
 
+mod cache_policy;
 mod error;
 mod model;
 mod path;
@@ -24,6 +25,7 @@ pub mod coding;
 pub mod ietf;
 pub mod lite;
 
+pub use cache_policy::*;
 pub use error::*;
 pub use model::*;
 pub use path::*;

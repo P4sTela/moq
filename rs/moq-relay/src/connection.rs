@@ -37,6 +37,20 @@ impl Connection {
 		let publish = self.cluster.publisher(&token);
 		let subscribe = self.cluster.subscriber(&token);
 
+		// DEBUG: Log the actual values
+		tracing::debug!(
+			"token analysis: cluster={}, root={:?}, publish={:?}, subscribe={:?}",
+			token.cluster,
+			token.root,
+			token.publish,
+			token.subscribe
+		);
+		tracing::debug!(
+			"origin analysis: publish={}, subscribe={}",
+			if publish.is_some() { "Some" } else { "None" },
+			if subscribe.is_some() { "Some" } else { "None" }
+		);
+
 		match (&publish, &subscribe) {
 			(Some(publish), Some(subscribe)) => {
 				tracing::info!(root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
