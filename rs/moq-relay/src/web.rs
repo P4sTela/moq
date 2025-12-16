@@ -99,7 +99,8 @@ impl Web {
 			.route("/certificate.sha256", get(fingerprint))
 			.route("/announced", get(serve_announced))
 			.route("/announced/{*prefix}", get(serve_announced))
-			.route("/fetch/{*path}", get(serve_fetch));
+			.route("/fetch/{*path}", get(serve_fetch))
+			.route("/cluster/status", get(serve_cluster_status));
 
 		// If WebSocket is enabled, add the WebSocket route.
 		let app = match self.config.ws {
@@ -373,6 +374,80 @@ fn tungstenite_to_axum(
 			}
 		})
 	})
+}
+
+/// Serve cluster status information
+async fn serve_cluster_status(State(state): State<Arc<WebState>>) -> axum::response::Result<String> {
+	#[derive(Serialize)]
+	struct ClusterStatus {
+		cluster_enabled: bool,
+		cluster_root: Option<String>,
+		cluster_node: Option<String>,
+		primary_broadcasts: usize,
+		secondary_broadcasts: usize,
+		combined_broadcasts: usize,
+		predictive_cache_enabled: bool,
+		predictive_cache_metrics: Option<CacheMetrics>,
+	}
+
+	#[derive(Serialize)]
+	struct CacheMetrics {
+		hits: u64,
+		misses: u64,
+		prefetches: u64,
+		evictions: u64,
+		entry_count: usize,
+	}
+
+	// Count broadcasts in each origin
+	let mut primary = state.cluster.primary.consumer.consume();
+	let mut primary_count = 0;
+	while primary.try_announced().is_some() {
+		primary_count += 1;
+	}
+
+	let mut secondary = state.cluster.secondary.consumer.consume();
+	let mut secondary_count = 0;
+	while secondary.try_announced().is_some() {
+		secondary_count += 1;
+	}
+
+	let mut combined = state.cluster.combined.consumer.consume();
+	let mut combined_count = 0;
+	while combined.try_announced().is_some() {
+		combined_count += 1;
+	}
+
+	// Get predictive cache metrics if available
+	let (cache_enabled, cache_metrics) = if let Some(cache) = &state.cluster.predictive_cache {
+		let metrics = cache.metrics();
+		(
+			true,
+			Some(CacheMetrics {
+				hits: metrics.hits,
+				misses: metrics.misses,
+				prefetches: metrics.prefetches,
+				evictions: metrics.evictions,
+				entry_count: metrics.entry_count,
+			}),
+		)
+	} else {
+		(false, None)
+	};
+
+	let config = state.cluster.config();
+	let status = ClusterStatus {
+		cluster_enabled: config.root.is_some(),
+		cluster_root: config.root.clone(),
+		cluster_node: config.node.clone(),
+		primary_broadcasts: primary_count,
+		secondary_broadcasts: secondary_count,
+		combined_broadcasts: combined_count,
+		predictive_cache_enabled: cache_enabled,
+		predictive_cache_metrics: cache_metrics,
+	};
+
+	serde_json::to_string_pretty(&status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
 }
 
 fn default_true() -> bool {

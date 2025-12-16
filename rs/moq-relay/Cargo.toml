@@ -21,6 +21,7 @@ axum = { version = "0.8", features = ["tokio", "ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+glob = "0.3"
 http-body = "1"
 hyper = "=1.7.0"
 hyper-serve = { version = "0.6", features = [
@@ -32,6 +33,7 @@ moq-native = { workspace = true }
 moq-token = { workspace = true }
 sd-notify = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_with = { version = "3", features = ["json", "base64"] }
 thiserror = "2"
 tokio = { workspace = true, features = ["full"] }

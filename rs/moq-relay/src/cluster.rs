@@ -1,11 +1,11 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use moq_lite::{Broadcast, BroadcastConsumer, BroadcastProducer, Origin, OriginConsumer, OriginProducer};
+use moq_lite::{Broadcast, BroadcastConsumer, BroadcastProducer, Origin, OriginConsumer, OriginProducer, Path};
 use tracing::Instrument;
 use url::Url;
 
-use crate::AuthToken;
+use crate::{AuthToken, PredictiveCache};
 
 #[serde_with::serde_as]
 #[derive(clap::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
@@ -49,6 +49,43 @@ pub struct ClusterConfig {
 		env = "MOQ_CLUSTER_PREFIX"
 	)]
 	pub prefix: String,
+
+	/// Predictive cache configuration for edge relay (TOML only)
+	#[arg(skip)]
+	#[serde(default)]
+	pub predictive_cache: PredictiveCacheConfig,
+}
+
+/// Predictive cache configuration for edge relay (TOML only, no CLI args)
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PredictiveCacheConfig {
+	/// Enable predictive caching (prefetch content based on ANNOUNCE)
+	pub enabled: bool,
+
+	/// Glob patterns for broadcasts to prefetch (e.g., "live/**", "sports/*")
+	pub prefetch_patterns: Vec<String>,
+
+	/// How many seconds to look ahead for prefetching (0 = unlimited)
+	pub lookahead_seconds: u64,
+
+	/// Maximum cache size in bytes (0 = unlimited)
+	pub max_cache_bytes: u64,
+
+	/// Time-to-live for cached content in seconds (0 = unlimited)
+	pub ttl_seconds: u64,
+}
+
+impl Default for PredictiveCacheConfig {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			prefetch_patterns: Vec::new(),
+			lookahead_seconds: 0,
+			max_cache_bytes: 0,
+			ttl_seconds: 3600,
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -67,10 +104,45 @@ pub struct Cluster {
 
 	// Broadcasts announced by local clients and remote servers.
 	pub combined: Arc<moq_lite::Produce<OriginProducer, OriginConsumer>>,
+
+	// Predictive cache for edge relay (optional)
+	pub predictive_cache: Option<Arc<PredictiveCache>>,
 }
 
 impl Cluster {
+	/// Get cluster configuration
+	pub fn config(&self) -> &ClusterConfig {
+		&self.config
+	}
+
 	pub fn new(config: ClusterConfig, client: moq_native::Client) -> Self {
+		// Log full cluster configuration for debugging
+		tracing::info!(
+			config = ?config,
+			"cluster configuration loaded"
+		);
+
+		// Initialize predictive cache if enabled
+		let predictive_cache = if config.predictive_cache.enabled {
+			tracing::info!("predictive cache is enabled, initializing...");
+			match PredictiveCache::new(config.predictive_cache.clone()) {
+				Ok(cache) => {
+					let cache = Arc::new(cache);
+					// Spawn background cleanup task
+					cache.clone().spawn_cleanup_task();
+					tracing::info!("predictive cache successfully initialized");
+					Some(cache)
+				}
+				Err(e) => {
+					tracing::warn!("Failed to initialize predictive cache: {}", e);
+					None
+				}
+			}
+		} else {
+			tracing::info!("predictive cache is disabled");
+			None
+		};
+
 		Cluster {
 			config,
 			client,
@@ -78,6 +150,7 @@ impl Cluster {
 			primary: Arc::new(Origin::produce()),
 			secondary: Arc::new(Origin::produce()),
 			combined: Arc::new(Origin::produce()),
+			predictive_cache,
 		}
 	}
 
@@ -116,6 +189,24 @@ impl Cluster {
 	}
 
 	pub fn get(&self, broadcast: &str) -> Option<BroadcastConsumer> {
+		// 🚀 Predictive Cache: キャッシュから取得を試みる
+		if let Some(cache) = &self.predictive_cache {
+			let path = Path::from(broadcast);
+			if let Some(cached) = cache.get(&path) {
+				tracing::debug!(
+					broadcast = %broadcast,
+					"predictive cache: serving from cache (HIT)"
+				);
+				return Some(cached);
+			} else {
+				tracing::debug!(
+					broadcast = %broadcast,
+					"predictive cache: not in cache (MISS)"
+				);
+			}
+		}
+
+		// キャッシュにない場合は通常のフォールバック
 		self.primary
 			.consumer
 			.consume_broadcast(broadcast)
@@ -181,15 +272,15 @@ impl Cluster {
 		let mut secondary = self.secondary.consumer.consume();
 
 		loop {
-			let (name, broadcast) = tokio::select! {
+			let (name, broadcast, from_secondary) = tokio::select! {
 				biased;
 				Some((name, broadcast)) = primary.announced() => {
 					tracing::debug!(source = "primary", broadcast = %name.as_str(), "run_combined: received announcement");
-					(name, broadcast)
+					(name, broadcast, false)
 				},
 				Some((name, broadcast)) = secondary.announced() => {
 					tracing::debug!(source = "secondary", broadcast = %name.as_str(), "run_combined: received announcement");
-					(name, broadcast)
+					(name, broadcast, true)
 				},
 				else => {
 					tracing::debug!("run_combined: all sources closed");
@@ -199,7 +290,53 @@ impl Cluster {
 
 			if let Some(broadcast) = broadcast {
 				tracing::debug!(broadcast = %name.as_str(), "run_combined: publishing to combined origin");
-				self.combined.producer.publish_broadcast(&name, broadcast);
+
+				// 🚀 Predictive Cache: Check cache first, then prefetch if needed
+				let broadcast_to_publish = if from_secondary {
+					if let Some(cache) = &self.predictive_cache {
+						let path = Path::from(name.as_str());
+
+						// Try to get from cache first (cache hit)
+						if let Some(cached) = cache.get(&path) {
+							tracing::debug!(
+								broadcast = %name.as_str(),
+								"predictive cache: serving from cache (HIT)"
+							);
+							cached
+						} else {
+							// Cache miss - prefetch for future use
+							if cache.should_prefetch(&name) {
+								tracing::debug!(
+									broadcast = %name.as_str(),
+									"predictive cache: prefetching broadcast from Root (MISS)"
+								);
+
+								// Clone broadcast consumer for caching
+								let cached_consumer = broadcast.clone();
+								let cache_clone = cache.clone();
+								let name_clone = name.clone();
+
+								// Spawn prefetch task asynchronously
+								tokio::spawn(async move {
+									if let Err(e) = cache_clone.prefetch(name_clone.clone(), cached_consumer).await {
+										tracing::warn!(
+											broadcast = %name_clone.as_str(),
+											error = %e,
+											"predictive cache: prefetch failed"
+										);
+									}
+								});
+							}
+							broadcast
+						}
+					} else {
+						broadcast
+					}
+				} else {
+					broadcast
+				};
+
+				self.combined.producer.publish_broadcast(&name, broadcast_to_publish);
 			}
 		}
 	}

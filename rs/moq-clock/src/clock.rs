@@ -16,22 +16,25 @@ impl Publisher {
 		let start = Utc::now();
 		let mut now = start;
 
-		// Just for fun, don't start at zero.
-		let mut sequence = start.minute();
+		// Start at zero for testing
+		let mut sequence = 0u64;
 
 		loop {
 			let segment = self.track.create_group(sequence.into()).unwrap();
+
+			tracing::info!(sequence = sequence, "sending segment");
 
 			sequence += 1;
 
 			tokio::spawn(async move {
 				if let Err(err) = Self::send_segment(segment, now).await {
-					tracing::warn!("failed to send minute: {:?}", err);
+					tracing::warn!("failed to send segment: {:?}", err);
 				}
 			});
 
-			let next = now + chrono::Duration::try_minutes(1).unwrap();
-			let next = next.with_second(0).unwrap().with_nanosecond(0).unwrap();
+			// Send every 1 second instead of every 1 minute
+			let next = now + chrono::Duration::try_seconds(1).unwrap();
+			let next = next.with_nanosecond(0).unwrap();
 
 			let delay = (next - now).to_std().unwrap();
 			tokio::time::sleep(delay).await;
@@ -40,32 +43,13 @@ impl Publisher {
 		}
 	}
 
-	async fn send_segment(mut segment: GroupProducer, mut now: DateTime<Utc>) -> anyhow::Result<()> {
-		// Everything but the second.
-		let base = now.format("%Y-%m-%d %H:%M:").to_string();
-
-		segment.write_frame(base.clone());
-
-		loop {
-			let delta = now.format("%S").to_string();
-			segment.write_frame(delta.clone());
-
-			let next = now + chrono::Duration::try_seconds(1).unwrap();
-			let next = next.with_nanosecond(0).unwrap();
-
-			let delay = (next - now).to_std().unwrap();
-			tokio::time::sleep(delay).await;
-
-			// Get the current time again to check if we overslept
-			let next = Utc::now();
-			if next.minute() != now.minute() {
-				break;
-			}
-
-			now = next;
-		}
-
+	async fn send_segment(mut segment: GroupProducer, now: DateTime<Utc>) -> anyhow::Result<()> {
+		// Send current timestamp as a single frame
+		let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+		tracing::debug!(timestamp = %timestamp, "writing frame");
+		segment.write_frame(timestamp);
 		segment.close();
+		tracing::debug!("segment closed");
 
 		Ok(())
 	}
