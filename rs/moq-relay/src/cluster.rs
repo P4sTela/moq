@@ -83,13 +83,20 @@ impl Cluster {
 
 	// For a given auth token, return the origin that should be used for the session.
 	pub fn subscriber(&self, token: &AuthToken) -> Option<OriginConsumer> {
-		// These broadcasts will be served to the session (when it subscribes).
-		// If this is a cluster node, then only publish our primary broadcasts.
-		// Otherwise publish everything.
-		let subscribe_origin = match token.cluster {
-			true => &self.primary,
-			false => &self.combined,
-		};
+		// 🔑 Leaf Pull Implementation: Always return combined origin
+		//
+		// This allows Leaf nodes to receive ALL broadcasts from the Root node,
+		// enabling Root → Leaf ANNOUNCE propagation.
+		//
+		// Flow:
+		// 1. Leaf connects to Root with cluster=true JWT
+		// 2. Root's subscriber() returns combined origin (not primary)
+		// 3. Leaf receives all broadcasts: primary (local clients) + secondary (other Leafs)
+		// 4. ANNOUNCE propagation: Leaf1 → Root → Leaf2 ✅
+		//
+		// Previous behavior (token.cluster check) caused Leaf to only see primary,
+		// preventing Root → Leaf propagation.
+		let subscribe_origin = &self.combined;
 
 		// Scope the origin to our root.
 		let subscribe_origin = subscribe_origin.producer.with_root(&token.root)?;

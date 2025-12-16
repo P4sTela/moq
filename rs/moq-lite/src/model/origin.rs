@@ -1,6 +1,9 @@
 use std::{
 	collections::HashMap,
-	sync::{atomic::{AtomicU64, Ordering}, Arc},
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		Arc,
+	},
 	time::Instant,
 };
 use tokio::sync::mpsc;
@@ -178,11 +181,13 @@ impl OriginNode {
 				active: broadcast.clone(),
 				backup: Vec::new(),
 			});
+			tracing::debug!(broadcast = %full.as_str(), consumers = self.notify.lock().consumers.len(), "OriginNode::publish - announcing new broadcast");
 			self.notify.lock().announce(full, broadcast);
 		}
 	}
 
 	fn consume(&mut self, id: ConsumerId, mut notify: OriginConsumerNotify) {
+		tracing::debug!(consumer_id = ?id, "OriginNode::consume - registering consumer");
 		self.consume_initial(&mut notify);
 		self.notify.lock().consumers.insert(id, notify);
 	}
@@ -1373,10 +1378,7 @@ mod tests {
 		use crate::PatternBasedCachePolicy;
 
 		// Test with policy that limits backups to 2
-		let policy = Arc::new(
-			PatternBasedCachePolicy::new()
-				.with_backup_max_count(2)
-		);
+		let policy = Arc::new(PatternBasedCachePolicy::new().with_backup_max_count(2));
 		let root_node = Lock::new(OriginNode::new(None, policy));
 
 		let broadcast1 = Broadcast::produce();
@@ -1404,10 +1406,7 @@ mod tests {
 		use std::time::Duration;
 
 		// Test with policy that limits backup age to 1 second
-		let policy = Arc::new(
-			PatternBasedCachePolicy::new()
-				.with_backup_max_age(1)
-		);
+		let policy = Arc::new(PatternBasedCachePolicy::new().with_backup_max_age(1));
 		let root_node = Lock::new(OriginNode::new(None, policy));
 
 		let broadcast1 = Broadcast::produce();
@@ -1462,7 +1461,11 @@ mod tests {
 		{
 			let node = root_node.lock();
 			let broadcast_state = node.broadcast.as_ref().unwrap();
-			assert_eq!(broadcast_state.backup.len(), 4, "AlwaysCachePolicy should keep all backups");
+			assert_eq!(
+				broadcast_state.backup.len(),
+				4,
+				"AlwaysCachePolicy should keep all backups"
+			);
 		}
 	}
 }
