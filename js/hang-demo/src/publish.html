@@ -19,13 +19,18 @@
 		See `publish.ts` for an example changing the broadcast based on a query parameter.
 
 		The relay url is loaded from an environment as it contains a generated JWT authentication token.
-		Feel free to hard-code it if you have public access configured, like `url="https://relay.moq.dev/anon"`
+		Feel free to hard-code it if you have public access configured, like `url="https://cdn.moq.dev/anon"`
 		NOTE: `http` performs an insecure certificate check. You must use `https` in production.
 	-->
-	<hang-publish url="%VITE_RELAY_URL%" path="me" controls>
-		<!-- It's optional to provide a video element to preview the outgoing media. -->
-		<video style="width: 100%; height: auto; border-radius: 4px; margin: 0 auto;" muted autoplay></video>
-	</hang-publish>
+	<hang-publish-ui>
+		<hang-publish url="%VITE_RELAY_URL%" path="me">
+			<video
+				style="width: 100%; height: auto; border-radius: 4px; margin: 0 auto;"
+				muted
+				autoplay
+			></video>
+		</hang-publish>
+	</hang-publish-ui>
 
 	<h3>Other demos:</h3>
 	<ul>
@@ -45,25 +50,12 @@
 		Reusing the same broadcast path means viewers will automatically reconnect to the new session.
 		Try reloading the page and broadcasting again; viewers will automatically reconnect.
 	</p>
-	<hr/>
-	<p>
-		Use <code class="language-html">&lt;hang-publish captions&gt;</code> to enable captions generation.
-		This uses a VAD model to detect when you're speaking which is when the 🗣 emoji appears.
-		At the end of a sentence, we run another model to generate the caption which is available over the network.
-	</p>
-	<p>
-		The AI models are executed using <a href="https://huggingface.co/docs/transformers.js/en/index">Transformers.js</a>.
-		This uses WebGPU when available, otherwise it falls back to WebAssembly.
-		They run in a WebWorker to avoid blocking the main thread so unless battery is an issue, keep the automatic transcription enabled!
-		But if you want to disable it, the `transcribe` attribute controls whether transcription is enabled.
-	</p>
 	<hr />
 	<p>
 		Media only flows over the network when requested!
 		Connecting to a relay means the broadcast is advertised as available, but nothing is transferred until there's
 		at least one viewer per track.
 		If there's multiple viewers, the relay will fan out the media to all of them.
-		<b>TODO</b>: We still encode media even when there are no viewers, but somebody should improve this.
 	</p>
 	<p>
 		You can create a broadcaster via the provided <code class="language-html">&lt;hang-publish&gt;</code> <a
@@ -85,8 +77,8 @@ publish.broadcast.audio.enabled.set(true);</code></pre>
 		Yeah it's pretty gross.
 	</p>
 	<p>
-		If you want to do things more efficiently, you can use the GStreamer plugin from the separate
-		<a href="https://github.com/kixelated/hang-gst">hang-gst repository</a>.
+		If you want to do things more efficiently, you can use the
+		<a href="https://github.com/moq-dev/gstreamer">Gstreamer plugin</a>.
 		It's pretty crude and doesn't handle all pipeline events; contributions welcome!
 	</p>
 	<hr />

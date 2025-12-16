@@ -1,13 +1,11 @@
 mod av1;
 mod codec;
-mod detection;
 mod h264;
 mod h265;
 mod vp9;
 
 pub use av1::*;
 pub use codec::*;
-pub use detection::*;
 pub use h264::*;
 pub use h265::*;
 pub use vp9::*;
@@ -24,7 +22,7 @@ use serde_with::{hex::Hex, DisplayFromStr};
 /// and optional metadata like detection, display settings, rotation, and flip.
 #[serde_with::serde_as]
 #[serde_with::skip_serializing_none]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Video {
 	/// A map of track name to rendition configuration.
@@ -48,10 +46,6 @@ pub struct Video {
 	/// Default: false
 	#[serde(default)]
 	pub flip: Option<bool>,
-
-	/// The detection configuration.
-	#[serde(default)]
-	pub detection: Option<Detection>,
 }
 
 /// Display size for rendering video

@@ -1,4 +1,4 @@
-import { Effect, Signal } from "@kixelated/signals";
+import { Effect, Signal } from "@moq/signals";
 import type { Source } from "./source";
 
 export type RendererProps = {
@@ -39,8 +39,10 @@ export class Renderer {
 		if (!canvas) return;
 
 		const display = effect.get(this.source.display);
-		canvas.width = display?.width ?? 1;
-		canvas.height = display?.height ?? 1;
+		if (!display) return; // Keep current canvas size until we have new dimensions
+
+		canvas.width = display.width;
+		canvas.height = display.height;
 	}
 
 	// Detect when video should be downloaded.

@@ -9,7 +9,7 @@ use rustls::sign::CertifiedKey;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use url::Url;
-use web_transport_quinn::http;
+use web_transport_quinn::{http, ServerError};
 
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -63,8 +63,9 @@ pub struct ServerTlsConfig {
 pub struct ServerConfig {
 	/// Listen for UDP packets on the given address.
 	/// Defaults to `[::]:443` if not provided.
-	#[arg(long, env = "MOQ_SERVER_LISTEN")]
-	pub listen: Option<net::SocketAddr>,
+	#[serde(alias = "listen")]
+	#[arg(id = "server-bind", long = "server-bind", alias = "listen", env = "MOQ_SERVER_BIND")]
+	pub bind: Option<net::SocketAddr>,
 
 	#[command(flatten)]
 	#[serde(default)]
@@ -121,7 +122,8 @@ impl Server {
 
 		tls.alpn_protocols = vec![
 			web_transport_quinn::ALPN.as_bytes().to_vec(),
-			moq_lite::ALPN.as_bytes().to_vec(),
+			moq_lite::lite::ALPN.as_bytes().to_vec(),
+			moq_lite::ietf::ALPN.as_bytes().to_vec(),
 		];
 		tls.key_log = Arc::new(rustls::KeyLogFile::new());
 
@@ -133,7 +135,7 @@ impl Server {
 		let runtime = quinn::default_runtime().context("no async runtime")?;
 		let endpoint_config = quinn::EndpointConfig::default();
 
-		let listen = config.listen.unwrap_or("[::]:443".parse().unwrap());
+		let listen = config.bind.unwrap_or("[::]:443".parse().unwrap());
 		let socket = std::net::UdpSocket::bind(listen).context("failed to bind UDP socket")?;
 
 		// Create the generic QUIC endpoint.
@@ -213,7 +215,7 @@ impl Server {
 					.context("failed to receive WebTransport request")?;
 				Ok(Request::WebTransport(request))
 			}
-			moq_lite::ALPN => Ok(Request::Quic(QuicRequest::accept(conn))),
+			moq_lite::lite::ALPN | moq_lite::ietf::ALPN => Ok(Request::Quic(QuicRequest::accept(conn))),
 			_ => anyhow::bail!("unsupported ALPN: {alpn}"),
 		}
 	}
@@ -234,7 +236,7 @@ pub enum Request {
 
 impl Request {
 	/// Reject the session, returning your favorite HTTP status code.
-	pub async fn close(self, status: http::StatusCode) -> Result<(), quinn::WriteError> {
+	pub async fn close(self, status: http::StatusCode) -> Result<(), ServerError> {
 		match self {
 			Self::WebTransport(request) => request.close(status).await,
 			Self::Quic(request) => {
@@ -248,7 +250,7 @@ impl Request {
 	///
 	/// For WebTransport, this completes the HTTP handshake (200 OK).
 	/// For raw QUIC, this constructs a raw session.
-	pub async fn ok(self) -> Result<web_transport_quinn::Session, quinn::WriteError> {
+	pub async fn ok(self) -> Result<web_transport_quinn::Session, ServerError> {
 		match self {
 			Request::WebTransport(request) => request.ok().await,
 			Request::Quic(request) => Ok(request.ok()),

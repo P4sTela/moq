@@ -2,17 +2,21 @@
 name = "moq-token"
 description = "Media over QUIC - Token Generation and Validation"
 authors = ["Luke Curley"]
-repository = "https://github.com/kixelated/moq"
+repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"
 base64 = "0.22"
-jsonwebtoken = "9"
+elliptic-curve = "0.13.8"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+p256 = "0.13.2"
+p384 = "0.13.1"
+rsa = "0.9.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = { version = "3", features = ["base64"] }

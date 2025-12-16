@@ -1,6 +1,6 @@
-import * as Moq from "@kixelated/moq";
-import { Effect, type Getter, Signal } from "@kixelated/signals";
-import * as Catalog from "../../catalog";
+import type * as Moq from "@moq/lite";
+import { Effect, type Getter, Signal } from "@moq/signals";
+import type * as Catalog from "../../catalog";
 
 export interface TypingProps {
 	// Whether to start downloading the chat.

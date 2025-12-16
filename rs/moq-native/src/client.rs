@@ -14,15 +14,19 @@ pub struct ClientTls {
 	/// This value can be provided multiple times for multiple roots.
 	/// If this is empty, system roots will be used instead
 	#[serde(skip_serializing_if = "Vec::is_empty")]
-	#[arg(long = "tls-root", env = "MOQ_CLIENT_TLS_ROOT")]
+	#[arg(id = "tls-root", long = "tls-root", env = "MOQ_CLIENT_TLS_ROOT")]
 	pub root: Vec<PathBuf>,
 
 	/// Danger: Disable TLS certificate verification.
 	///
 	/// Fine for local development and between relays, but should be used in caution in production.
-	// This is an Option<bool> so clap skips over it when not provided, otherwise it is set to false.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	#[arg(long = "tls-disable-verify", env = "MOQ_CLIENT_TLS_DISABLE_VERIFY")]
+	#[arg(
+		id = "tls-disable-verify",
+		long = "tls-disable-verify",
+		env = "MOQ_CLIENT_TLS_DISABLE_VERIFY",
+		action = clap::ArgAction::SetTrue
+	)]
 	pub disable_verify: Option<bool>,
 }
 
@@ -30,7 +34,12 @@ pub struct ClientTls {
 #[serde(deny_unknown_fields, default)]
 pub struct ClientConfig {
 	/// Listen for UDP packets on the given address.
-	#[arg(long, id = "client-bind", default_value = "[::]:0", env = "MOQ_CLIENT_BIND")]
+	#[arg(
+		id = "client-bind",
+		long = "client-bind",
+		default_value = "[::]:0",
+		env = "MOQ_CLIENT_BIND"
+	)]
 	pub bind: net::SocketAddr,
 
 	#[command(flatten)]
@@ -168,7 +177,8 @@ impl Client {
 
 		let alpn = match url.scheme() {
 			"https" => web_transport_quinn::ALPN,
-			"moql" => moq_lite::ALPN,
+			"moql" => moq_lite::lite::ALPN,
+			"moqt" => moq_lite::ietf::ALPN,
 			_ => anyhow::bail!("url scheme must be 'http', 'https', or 'moql'"),
 		};
 
@@ -187,7 +197,7 @@ impl Client {
 
 		let session = match alpn {
 			web_transport_quinn::ALPN => web_transport_quinn::Session::connect(connection, url).await?,
-			moq_lite::ALPN => web_transport_quinn::Session::raw(connection, url),
+			moq_lite::lite::ALPN | moq_lite::ietf::ALPN => web_transport_quinn::Session::raw(connection, url),
 			_ => unreachable!("ALPN was checked above"),
 		};
 

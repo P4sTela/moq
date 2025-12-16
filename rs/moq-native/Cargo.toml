@@ -2,10 +2,10 @@
 name = "moq-native"
 description = "Media over QUIC - Helper library for native applications"
 authors = ["Luke Curley"]
-repository = "https://github.com/kixelated/moq"
+repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.8.4"
+version = "0.10.1"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -42,3 +42,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 web-transport-quinn = { workspace = true }
+
+[dev-dependencies]
+anyhow = "1"
+bytes = "1"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+url = "2"

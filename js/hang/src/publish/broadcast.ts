@@ -1,5 +1,5 @@
-import * as Moq from "@kixelated/moq";
-import { Effect, Signal } from "@kixelated/signals";
+import * as Moq from "@moq/lite";
+import { Effect, Signal } from "@moq/signals";
 import * as Catalog from "../catalog";
 import * as Audio from "./audio";
 import * as Chat from "./chat";
@@ -99,14 +99,8 @@ export class Broadcast {
 					case Chat.Message.TRACK:
 						this.chat.message.serve(request.track, effect);
 						break;
-					case Video.Detection.TRACK:
-						this.video.detection.serve(request.track, effect);
-						break;
 					case Audio.Encoder.TRACK:
 						this.audio.serve(request.track, effect);
-						break;
-					case Audio.Speaking.TRACK:
-						this.audio.speaking.serve(request.track, effect);
 						break;
 					case Video.Root.TRACK_HD:
 						this.video.hd.serve(request.track, effect);

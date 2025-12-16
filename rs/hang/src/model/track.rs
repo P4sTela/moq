@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
+use std::ops::Deref;
 
 use crate::model::{Frame, GroupConsumer, Timestamp};
 use crate::Error;
 use futures::{stream::FuturesUnordered, StreamExt};
 
-use moq_lite::coding::*;
+use moq_lite::{coding::*, lite};
 
 /// A producer for media tracks.
 ///
@@ -21,12 +22,17 @@ use moq_lite::coding::*;
 pub struct TrackProducer {
 	pub inner: moq_lite::TrackProducer,
 	group: Option<moq_lite::GroupProducer>,
+	keyframe: Option<Timestamp>,
 }
 
 impl TrackProducer {
 	/// Create a new TrackProducer wrapping the given moq-lite producer.
 	pub fn new(inner: moq_lite::TrackProducer) -> Self {
-		Self { inner, group: None }
+		Self {
+			inner,
+			group: None,
+			keyframe: None,
+		}
 	}
 
 	/// Write a frame to the track.
@@ -38,29 +44,47 @@ impl TrackProducer {
 	///
 	/// The timestamp is usually monotonically increasing, but it depends on the encoding.
 	/// For example, H.264 B-frames will introduce jitter and reordering.
-	pub fn write(&mut self, frame: Frame) {
-		let timestamp = frame.timestamp.as_micros() as u64;
+	pub fn write(&mut self, frame: Frame) -> Result<(), Error> {
+		tracing::trace!(?frame, "write frame");
+
 		let mut header = BytesMut::new();
-		timestamp.encode(&mut header);
+		frame.timestamp.as_micros().encode(&mut header, lite::Version::Draft02);
 
 		if frame.keyframe {
 			if let Some(group) = self.group.take() {
 				group.close();
 			}
+
+			// Make sure this frame's timestamp doesn't go backwards relative to the last keyframe.
+			// We can't really enforce this for frames generally because b-frames suck.
+			if let Some(keyframe) = self.keyframe {
+				if frame.timestamp < keyframe {
+					return Err(Error::TimestampBackwards);
+				}
+			}
+
+			self.keyframe = Some(frame.timestamp);
 		}
 
 		let mut group = match self.group.take() {
 			Some(group) => group,
-			None => self.inner.append_group(),
+			None if frame.keyframe => self.inner.append_group(),
+			// The first frame must be a keyframe.
+			None => return Err(Error::MissingKeyframe),
 		};
 
-		let size = header.len() + frame.payload.len();
+		let size = header.len() + frame.payload.remaining();
+
 		let mut chunked = group.create_frame(size.into());
 		chunked.write_chunk(header.freeze());
-		chunked.write_chunk(frame.payload);
+		for chunk in frame.payload {
+			chunked.write_chunk(chunk);
+		}
 		chunked.close();
 
 		self.group.replace(group);
+
+		Ok(())
 	}
 
 	/// Create a consumer for this track.
@@ -75,6 +99,14 @@ impl TrackProducer {
 impl From<moq_lite::TrackProducer> for TrackProducer {
 	fn from(inner: moq_lite::TrackProducer) -> Self {
 		Self::new(inner)
+	}
+}
+
+impl Deref for TrackProducer {
+	type Target = moq_lite::TrackProducer;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
 	}
 }
 
@@ -122,9 +154,13 @@ impl TrackConsumer {
 	/// configured latency target.
 	///
 	/// Returns `None` when the track has ended.
-	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
+	pub async fn read_frame(&mut self) -> Result<Option<Frame>, Error> {
+		let latency = self.latency.try_into()?;
 		loop {
-			let cutoff = self.max_timestamp + self.latency;
+			let cutoff = self
+				.max_timestamp
+				.checked_add(latency)
+				.ok_or(crate::TimestampOverflow)?;
 
 			// Keep track of all pending groups, buffering until we detect a timestamp far enough in the future.
 			// This is a race; only the first group will succeed.
@@ -142,6 +178,7 @@ impl TrackConsumer {
 					match res {
 						// Got the next frame.
 						Ok(Some(frame)) => {
+							tracing::trace!(?frame, "read frame");
 							self.max_timestamp = frame.timestamp;
 							return Ok(Some(frame));
 						}
@@ -205,5 +242,19 @@ impl TrackConsumer {
 impl From<moq_lite::TrackConsumer> for TrackConsumer {
 	fn from(inner: moq_lite::TrackConsumer) -> Self {
 		Self::new(inner)
+	}
+}
+
+impl From<TrackConsumer> for moq_lite::TrackConsumer {
+	fn from(inner: TrackConsumer) -> Self {
+		inner.inner
+	}
+}
+
+impl Deref for TrackConsumer {
+	type Target = moq_lite::TrackConsumer;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
 	}
 }
