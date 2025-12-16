@@ -151,18 +151,29 @@ impl Cluster {
 
 	// Shovel broadcasts from the primary and secondary origins into the combined origin.
 	async fn run_combined(self) -> anyhow::Result<()> {
+		tracing::debug!("run_combined: starting");
 		let mut primary = self.primary.consumer.consume();
 		let mut secondary = self.secondary.consumer.consume();
 
 		loop {
 			let (name, broadcast) = tokio::select! {
 				biased;
-				Some(primary) = primary.announced() => primary,
-				Some(secondary) = secondary.announced() => secondary,
-				else => return Ok(()),
+				Some((name, broadcast)) = primary.announced() => {
+					tracing::debug!(source = "primary", broadcast = %name.as_str(), "run_combined: received announcement");
+					(name, broadcast)
+				},
+				Some((name, broadcast)) = secondary.announced() => {
+					tracing::debug!(source = "secondary", broadcast = %name.as_str(), "run_combined: received announcement");
+					(name, broadcast)
+				},
+				else => {
+					tracing::debug!("run_combined: all sources closed");
+					return Ok(());
+				}
 			};
 
 			if let Some(broadcast) = broadcast {
+				tracing::debug!(broadcast = %name.as_str(), "run_combined: publishing to combined origin");
 				self.combined.producer.publish_broadcast(&name, broadcast);
 			}
 		}
