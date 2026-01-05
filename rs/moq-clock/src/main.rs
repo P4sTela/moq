@@ -28,6 +28,10 @@ pub struct Config {
 	#[command(flatten)]
 	pub log: moq_native::Log,
 
+	/// Measure end-to-end latency (for subscribe mode)
+	#[arg(long, default_value = "false")]
+	pub measure_latency: bool,
+
 	/// Whether to publish the clock or consume it.
 	#[command(subcommand)]
 	pub role: Command,
@@ -89,6 +93,11 @@ async fn main() -> anyhow::Result<()> {
 
 			// The current subscriber if any, dropped after each announce.
 			let mut clock: Option<clock::Subscriber> = None;
+			let measure_latency = config.measure_latency;
+
+			if measure_latency {
+				tracing::info!("latency measurement enabled");
+			}
 
 			loop {
 				tokio::select! {
@@ -96,7 +105,11 @@ async fn main() -> anyhow::Result<()> {
 						(path, Some(broadcast)) => {
 							tracing::info!(broadcast = %path, "broadcast is online, subscribing to track");
 							let track = broadcast.subscribe_track(&track);
-							clock = Some(clock::Subscriber::new(track));
+							clock = Some(if measure_latency {
+								clock::Subscriber::with_latency_measurement(track)
+							} else {
+								clock::Subscriber::new(track)
+							});
 						}
 						(path, None) => {
 							tracing::warn!(broadcast = %path, "broadcast is offline, waiting...");

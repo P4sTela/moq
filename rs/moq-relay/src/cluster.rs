@@ -304,7 +304,7 @@ impl Cluster {
 							);
 							cached
 						} else {
-							// Cache miss - prefetch for future use
+							// Cache miss - prefetch and use cached consumer
 							if cache.should_prefetch(&name) {
 								tracing::debug!(
 									broadcast = %name.as_str(),
@@ -313,21 +313,29 @@ impl Cluster {
 
 								// Clone broadcast consumer for caching
 								let cached_consumer = broadcast.clone();
-								let cache_clone = cache.clone();
-								let name_clone = name.clone();
 
-								// Spawn prefetch task asynchronously
-								tokio::spawn(async move {
-									if let Err(e) = cache_clone.prefetch(name_clone.clone(), cached_consumer).await {
-										tracing::warn!(
-											broadcast = %name_clone.as_str(),
-											error = %e,
-											"predictive cache: prefetch failed"
+								// Prefetch synchronously to ensure cache is populated before publish
+								match cache.prefetch(name.clone(), cached_consumer).await {
+									Ok(()) => {
+										tracing::debug!(
+											broadcast = %name.as_str(),
+											"predictive cache: prefetch completed, using cached consumer"
 										);
+										// Use the cached consumer for publishing
+										cache.get(&path).unwrap_or(broadcast)
 									}
-								});
+									Err(e) => {
+										tracing::warn!(
+											broadcast = %name.as_str(),
+											error = %e,
+											"predictive cache: prefetch failed, using original"
+										);
+										broadcast
+									}
+								}
+							} else {
+								broadcast
 							}
-							broadcast
 						}
 					} else {
 						broadcast

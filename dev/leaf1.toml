@@ -1,17 +1,20 @@
-[log]
-level = "trace"
+# Leaf1 configuration without Predictive Cache (for comparison)
 
 [server]
 listen = "[::]:4444"
 tls.generate = ["localhost"]
 
 [web.http]
-listen = "[::]:8081"
+listen = "[::]:4444"
 
 [cluster]
-connect = "localhost:4443"
+root = "localhost:4443"
 token = "dev/root.jwt"
 node = "localhost:4444"
+
+# Predictive cache disabled
+[cluster.predictive_cache]
+enabled = false
 
 [client.tls]
 disable_verify = true

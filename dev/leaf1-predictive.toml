@@ -12,7 +12,7 @@ listen = "[::]:4444"
 
 [cluster]
 # Connect to Root
-connect = "localhost:4443"
+root = "localhost:4443"
 token = "dev/root.jwt"
 
 # Advertise ourselves to Root

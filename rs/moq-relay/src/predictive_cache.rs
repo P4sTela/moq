@@ -122,6 +122,13 @@ impl PredictiveCache {
 		metrics.prefetches += 1;
 		metrics.entry_count = self.storage.lock().unwrap().len();
 
+		debug!(
+			path = %path.as_str(),
+			prefetches = metrics.prefetches,
+			entry_count = metrics.entry_count,
+			"prefetch completed successfully"
+		);
+
 		Ok(())
 	}
 
