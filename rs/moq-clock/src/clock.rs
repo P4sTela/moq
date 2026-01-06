@@ -118,6 +118,7 @@ impl LatencyStats {
 pub struct Subscriber {
 	track: TrackConsumer,
 	measure_latency: bool,
+	subscribe_start: Option<DateTime<Utc>>,
 }
 
 impl Subscriber {
@@ -125,6 +126,7 @@ impl Subscriber {
 		Self {
 			track,
 			measure_latency: false,
+			subscribe_start: None,
 		}
 	}
 
@@ -132,11 +134,13 @@ impl Subscriber {
 		Self {
 			track,
 			measure_latency: true,
+			subscribe_start: Some(Utc::now()), // Record subscribe start time
 		}
 	}
 
 	pub async fn run(mut self) -> anyhow::Result<()> {
 		let mut stats = LatencyStats::default();
+		let mut ttfs_recorded = false;
 
 		// Install Ctrl+C handler to print stats on exit
 		let stats_on_exit = self.measure_latency;
@@ -148,11 +152,22 @@ impl Subscriber {
 				.context("failed to get first object")?
 				.context("empty group")?;
 
+			let recv_time = Utc::now();
 			let base_str = String::from_utf8_lossy(&base);
 
 			if self.measure_latency {
+				// Record TTFS (Time To First Sample) on first data
+				if !ttfs_recorded {
+					if let Some(start) = self.subscribe_start {
+						let ttfs = recv_time.signed_duration_since(start);
+						let ttfs_ms = ttfs.num_milliseconds() as f64
+							+ (ttfs.num_microseconds().unwrap_or(0) % 1000) as f64 / 1000.0;
+						println!("TTFS: {:.2} ms (Time To First Sample)", ttfs_ms);
+					}
+					ttfs_recorded = true;
+				}
+
 				// Parse timestamp and calculate latency
-				let recv_time = Utc::now();
 				if let Ok(send_time) = NaiveDateTime::parse_from_str(&base_str, "%Y-%m-%d %H:%M:%S%.3f") {
 					let send_time = send_time.and_utc();
 					let latency = recv_time.signed_duration_since(send_time);
