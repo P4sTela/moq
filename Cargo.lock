@@ -1484,6 +1484,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-avatar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "moq-lite",
+ "moq-native",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "moq-clock"
 version = "0.10.0"
 dependencies = [

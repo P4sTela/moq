@@ -3,6 +3,7 @@ members = [
     "rs/hang",
     "rs/hang-cli",
     "rs/libmoq",
+    "rs/moq-avatar",
     "rs/moq-clock",
     "rs/moq-lite",
     "rs/moq-native",
