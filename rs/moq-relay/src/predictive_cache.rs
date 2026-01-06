@@ -17,6 +17,7 @@ struct CachedBroadcast {
 	/// When this entry was cached
 	cached_at: SystemTime,
 	/// Estimated size in bytes (if known)
+	#[allow(dead_code)] // Reserved for future size-based eviction
 	size_bytes: Option<u64>,
 	/// Number of times this entry was accessed
 	access_count: u64,

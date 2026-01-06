@@ -102,10 +102,7 @@ mod tests {
 	#[test]
 	fn test_always_cache_policy() {
 		let policy = AlwaysCachePolicy;
-		assert_eq!(
-			policy.should_cache_broadcast(&Path::new("test")),
-			CacheDecision::Cache
-		);
+		assert_eq!(policy.should_cache_broadcast(&Path::new("test")), CacheDecision::Cache);
 		assert_eq!(
 			policy.should_cache_track(&Path::new("test"), "video", 128),
 			CacheDecision::Cache

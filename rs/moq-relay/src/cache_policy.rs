@@ -75,7 +75,7 @@ impl Default for BroadcastCachePolicy {
 }
 
 /// Track-level cache policy
-#[derive(Parser, Clone, Debug, Deserialize, Serialize)]
+#[derive(Parser, Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrackCachePolicy {
 	/// Maximum number of tracks to cache per broadcast
@@ -85,15 +85,6 @@ pub struct TrackCachePolicy {
 	/// Cache high priority tracks (priority >= threshold)
 	#[arg(long, default_value_t = 0)]
 	pub min_priority: u8,
-}
-
-impl Default for TrackCachePolicy {
-	fn default() -> Self {
-		Self {
-			max_tracks_per_broadcast: 0, // Unlimited by default
-			min_priority: 0,              // All priorities by default
-		}
-	}
 }
 
 /// Group-level cache policy
@@ -119,7 +110,7 @@ impl Default for GroupCachePolicy {
 }
 
 /// Global cache size limits
-#[derive(Parser, Clone, Debug, Deserialize, Serialize)]
+#[derive(Parser, Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CacheLimits {
 	/// Maximum total cache size in bytes (0 = unlimited)
@@ -133,16 +124,6 @@ pub struct CacheLimits {
 	/// Maximum frame size in bytes (0 = unlimited)
 	#[arg(long, default_value_t = 0)]
 	pub max_frame_size_bytes: u64,
-}
-
-impl Default for CacheLimits {
-	fn default() -> Self {
-		Self {
-			max_cache_size_bytes: 0,
-			max_broadcast_size_bytes: 0,
-			max_frame_size_bytes: 0,
-		}
-	}
 }
 
 impl CachePolicyConfig {
@@ -209,9 +190,9 @@ mod tests {
 				max_frames_per_group: 100,
 			},
 			limits: CacheLimits {
-				max_cache_size_bytes: 100 * 1024 * 1024, // 100MB
+				max_cache_size_bytes: 100 * 1024 * 1024,    // 100MB
 				max_broadcast_size_bytes: 10 * 1024 * 1024, // 10MB
-				max_frame_size_bytes: 1024 * 1024,        // 1MB
+				max_frame_size_bytes: 1024 * 1024,          // 1MB
 			},
 		};
 
@@ -228,8 +209,10 @@ mod tests {
 
 	#[test]
 	fn test_build_never_cache_policy() {
-		let mut config = CachePolicyConfig::default();
-		config.cache_enabled = false;
+		let config = CachePolicyConfig {
+			cache_enabled: false,
+			..Default::default()
+		};
 		let _policy = config.build().unwrap();
 		// Should use NeverCachePolicy when disabled
 	}
