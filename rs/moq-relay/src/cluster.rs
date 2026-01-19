@@ -5,7 +5,7 @@ use moq_lite::{Broadcast, BroadcastConsumer, BroadcastProducer, Origin, OriginCo
 use tracing::Instrument;
 use url::Url;
 
-use crate::{AuthToken, PredictiveCache};
+use crate::{AuthToken, DataCache, DataCacheConfig};
 
 #[serde_with::serde_as]
 #[derive(clap::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
@@ -50,42 +50,11 @@ pub struct ClusterConfig {
 	)]
 	pub prefix: String,
 
-	/// Predictive cache configuration for edge relay (TOML only)
+	/// Data cache configuration for edge relay (TOML only)
+	/// Supports both "data_cache" and "predictive_cache" in config for compatibility
 	#[arg(skip)]
-	#[serde(default)]
-	pub predictive_cache: PredictiveCacheConfig,
-}
-
-/// Predictive cache configuration for edge relay (TOML only, no CLI args)
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct PredictiveCacheConfig {
-	/// Enable predictive caching (prefetch content based on ANNOUNCE)
-	pub enabled: bool,
-
-	/// Glob patterns for broadcasts to prefetch (e.g., "live/**", "sports/*")
-	pub prefetch_patterns: Vec<String>,
-
-	/// How many seconds to look ahead for prefetching (0 = unlimited)
-	pub lookahead_seconds: u64,
-
-	/// Maximum cache size in bytes (0 = unlimited)
-	pub max_cache_bytes: u64,
-
-	/// Time-to-live for cached content in seconds (0 = unlimited)
-	pub ttl_seconds: u64,
-}
-
-impl Default for PredictiveCacheConfig {
-	fn default() -> Self {
-		Self {
-			enabled: false,
-			prefetch_patterns: Vec::new(),
-			lookahead_seconds: 0,
-			max_cache_bytes: 0,
-			ttl_seconds: 3600,
-		}
-	}
+	#[serde(default, alias = "predictive_cache")]
+	pub data_cache: DataCacheConfig,
 }
 
 #[derive(Clone)]
@@ -105,8 +74,8 @@ pub struct Cluster {
 	// Broadcasts announced by local clients and remote servers.
 	pub combined: Arc<moq_lite::Produce<OriginProducer, OriginConsumer>>,
 
-	// Predictive cache for edge relay (optional)
-	pub predictive_cache: Option<Arc<PredictiveCache>>,
+	// Data cache for edge relay (optional)
+	pub data_cache: Option<Arc<DataCache>>,
 }
 
 impl Cluster {
@@ -122,24 +91,24 @@ impl Cluster {
 			"cluster configuration loaded"
 		);
 
-		// Initialize predictive cache if enabled
-		let predictive_cache = if config.predictive_cache.enabled {
-			tracing::info!("predictive cache is enabled, initializing...");
-			match PredictiveCache::new(config.predictive_cache.clone()) {
+		// Initialize data cache if enabled
+		let data_cache = if config.data_cache.enabled {
+			tracing::info!("data cache is enabled, initializing...");
+			match DataCache::new(config.data_cache.clone()) {
 				Ok(cache) => {
 					let cache = Arc::new(cache);
 					// Spawn background cleanup task
 					cache.clone().spawn_cleanup_task();
-					tracing::info!("predictive cache successfully initialized");
+					tracing::info!("data cache successfully initialized");
 					Some(cache)
 				}
 				Err(e) => {
-					tracing::warn!("Failed to initialize predictive cache: {}", e);
+					tracing::warn!("Failed to initialize data cache: {}", e);
 					None
 				}
 			}
 		} else {
-			tracing::info!("predictive cache is disabled");
+			tracing::info!("data cache is disabled");
 			None
 		};
 
@@ -150,7 +119,7 @@ impl Cluster {
 			primary: Arc::new(Origin::produce()),
 			secondary: Arc::new(Origin::produce()),
 			combined: Arc::new(Origin::produce()),
-			predictive_cache,
+			data_cache,
 		}
 	}
 
@@ -189,24 +158,9 @@ impl Cluster {
 	}
 
 	pub fn get(&self, broadcast: &str) -> Option<BroadcastConsumer> {
-		// 🚀 Predictive Cache: キャッシュから取得を試みる
-		if let Some(cache) = &self.predictive_cache {
-			let path = Path::from(broadcast);
-			if let Some(cached) = cache.get(&path) {
-				tracing::debug!(
-					broadcast = %broadcast,
-					"predictive cache: serving from cache (HIT)"
-				);
-				return Some(cached);
-			} else {
-				tracing::debug!(
-					broadcast = %broadcast,
-					"predictive cache: not in cache (MISS)"
-				);
-			}
-		}
-
-		// キャッシュにない場合は通常のフォールバック
+		// Data cache doesn't return BroadcastConsumer directly
+		// It provides buffered track access via get_buffered_track()
+		// For broadcast lookup, use standard origin lookup
 		self.primary
 			.consumer
 			.consume_broadcast(broadcast)
@@ -291,57 +245,26 @@ impl Cluster {
 			if let Some(broadcast) = broadcast {
 				tracing::debug!(broadcast = %name.as_str(), "run_combined: publishing to combined origin");
 
-				// 🚀 Predictive Cache: Check cache first, then prefetch if needed
+				// 🚀 Data Cache: Start caching broadcasts from secondary (Root)
+				// Returns a local broadcast that serves cached data + live stream
 				let broadcast_to_publish = if from_secondary {
-					if let Some(cache) = &self.predictive_cache {
+					if let Some(cache) = &self.data_cache {
 						let path = Path::from(name.as_str());
-
-						// Try to get from cache first (cache hit)
-						if let Some(cached) = cache.get(&path) {
+						if cache.should_cache(&path) {
 							tracing::debug!(
 								broadcast = %name.as_str(),
-								"predictive cache: serving from cache (HIT)"
+								"data cache: starting to cache broadcast from Root"
 							);
-							cached
+							// start_caching returns a local broadcast consumer that serves cached data
+							cache.start_caching(path.to_owned(), broadcast.clone()).await
 						} else {
-							// Cache miss - prefetch and use cached consumer
-							if cache.should_prefetch(&name) {
-								tracing::debug!(
-									broadcast = %name.as_str(),
-									"predictive cache: prefetching broadcast from Root (MISS)"
-								);
-
-								// Clone broadcast consumer for caching
-								let cached_consumer = broadcast.clone();
-
-								// Prefetch synchronously to ensure cache is populated before publish
-								match cache.prefetch(name.clone(), cached_consumer).await {
-									Ok(()) => {
-										tracing::debug!(
-											broadcast = %name.as_str(),
-											"predictive cache: prefetch completed, using cached consumer"
-										);
-										// Use the cached consumer for publishing
-										cache.get(&path).unwrap_or(broadcast)
-									}
-									Err(e) => {
-										tracing::warn!(
-											broadcast = %name.as_str(),
-											error = %e,
-											"predictive cache: prefetch failed, using original"
-										);
-										broadcast
-									}
-								}
-							} else {
-								broadcast
-							}
+							broadcast.clone()
 						}
 					} else {
-						broadcast
+						broadcast.clone()
 					}
 				} else {
-					broadcast
+					broadcast.clone()
 				};
 
 				self.combined.producer.publish_broadcast(&name, broadcast_to_publish);

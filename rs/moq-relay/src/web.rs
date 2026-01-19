@@ -394,9 +394,10 @@ async fn serve_cluster_status(State(state): State<Arc<WebState>>) -> axum::respo
 	struct CacheMetrics {
 		hits: u64,
 		misses: u64,
-		prefetches: u64,
-		evictions: u64,
-		entry_count: usize,
+		groups_buffered: u64,
+		groups_evicted: u64,
+		broadcast_count: usize,
+		track_count: usize,
 	}
 
 	// Count broadcasts in each origin
@@ -418,17 +419,18 @@ async fn serve_cluster_status(State(state): State<Arc<WebState>>) -> axum::respo
 		combined_count += 1;
 	}
 
-	// Get predictive cache metrics if available
-	let (cache_enabled, cache_metrics) = if let Some(cache) = &state.cluster.predictive_cache {
-		let metrics = cache.metrics();
+	// Get data cache metrics if available
+	let (cache_enabled, cache_metrics) = if let Some(cache) = &state.cluster.data_cache {
+		let metrics = cache.metrics().await;
 		(
 			true,
 			Some(CacheMetrics {
 				hits: metrics.hits,
 				misses: metrics.misses,
-				prefetches: metrics.prefetches,
-				evictions: metrics.evictions,
-				entry_count: metrics.entry_count,
+				groups_buffered: metrics.groups_buffered,
+				groups_evicted: metrics.groups_evicted,
+				broadcast_count: metrics.broadcast_count,
+				track_count: metrics.track_count,
 			}),
 		)
 	} else {
