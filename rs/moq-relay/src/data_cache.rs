@@ -30,6 +30,9 @@ pub struct DataCacheConfig {
 	/// Glob patterns for broadcasts to cache
 	pub prefetch_patterns: Vec<String>,
 
+	/// Track names to proactively prefetch (e.g., ["seconds", "video", "audio"])
+	pub prefetch_tracks: Vec<String>,
+
 	/// TTL in seconds for cached broadcasts
 	pub ttl_seconds: u64,
 }
@@ -40,6 +43,11 @@ impl Default for DataCacheConfig {
 			enabled: false,
 			max_groups_per_track: 3,
 			prefetch_patterns: Vec::new(),
+			prefetch_tracks: vec![
+				"seconds".to_string(), // moq-clock
+				"video".to_string(),
+				"audio".to_string(),
+			],
 			ttl_seconds: 60,
 		}
 	}
@@ -160,6 +168,7 @@ impl DataCache {
 	pub fn new(config: DataCacheConfig) -> anyhow::Result<Self> {
 		info!(
 			patterns = ?config.prefetch_patterns,
+			tracks = ?config.prefetch_tracks,
 			max_groups = config.max_groups_per_track,
 			ttl_seconds = config.ttl_seconds,
 			"initializing data cache"
@@ -221,15 +230,9 @@ impl DataCache {
 
 		debug!(path = %path.as_str(), "broadcast entry created with local producer");
 
-		// Proactively start caching common tracks
-		// For moq-clock, the track is named "time" with priority 0
-		let common_tracks = vec![
-			Track { name: "time".to_string(), priority: 0 },
-			Track { name: "video".to_string(), priority: 0 },
-			Track { name: "audio".to_string(), priority: 0 },
-		];
-
-		for track in common_tracks {
+		// Proactively start caching configured tracks
+		for track_name in &self.config.prefetch_tracks {
+			let track = Track { name: track_name.clone(), priority: 0 };
 			let source = consumer.subscribe_track(&track);
 			debug!(
 				path = %path.as_str(),
@@ -596,6 +599,7 @@ mod tests {
 		let config = DataCacheConfig {
 			enabled: true,
 			prefetch_patterns: vec!["live/**".to_string(), "moq-clock".to_string()],
+			prefetch_tracks: vec!["seconds".to_string()],
 			max_groups_per_track: 3,
 			ttl_seconds: 60,
 		};

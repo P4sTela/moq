@@ -18,13 +18,12 @@ token = "dev/root.jwt"
 # Advertise ourselves to Root
 node = "localhost:4444"
 
-# Predictive cache configuration
-[cluster.predictive_cache]
+# Data cache configuration (buffers actual frame data)
+[cluster.data_cache]
 enabled = true
 prefetch_patterns = ["live/**", "sports/**", "moq-clock"]
-lookahead_seconds = 0  # Unlimited
-max_cache_bytes = 104857600  # 100MB
-ttl_seconds = 3600  # 1 hour
+max_groups_per_track = 3  # Ring buffer size
+ttl_seconds = 60
 
 [client.tls]
 disable_verify = true
