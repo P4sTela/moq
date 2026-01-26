@@ -1,5 +1,5 @@
 use std::{
-	collections::{hash_map::Entry, HashMap},
+	collections::HashMap,
 	sync::{atomic, Arc},
 };
 
@@ -129,13 +129,16 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	) -> Result<(), Error> {
 		tracing::debug!(broadcast = %self.log_path(&path), "announce");
 
-		let broadcast = Broadcast::produce();
+		// Ignore duplicate announcements - we already have a proxy for this broadcast.
+		// This can happen in bidirectional scenarios where local and remote broadcasts
+		// are published to the same origin, causing feedback loops.
+		if producers.contains_key(&path) {
+			tracing::debug!(broadcast = %self.log_path(&path), "ignoring duplicate announce");
+			return Ok(());
+		}
 
-		// Make sure the peer doesn't double announce.
-		match producers.entry(path.to_owned()) {
-			Entry::Occupied(_) => return Err(Error::Duplicate),
-			Entry::Vacant(entry) => entry.insert(broadcast.producer.clone()),
-		};
+		let broadcast = Broadcast::produce();
+		producers.insert(path.to_owned(), broadcast.producer.clone());
 
 		// Run the broadcast in the background until all consumers are dropped.
 		self.origin

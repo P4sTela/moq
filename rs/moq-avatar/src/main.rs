@@ -109,18 +109,30 @@ async fn main() -> anyhow::Result<()> {
 
     let session = client.connect(url).await?;
 
-    // Create origin for bidirectional communication
-    let origin = moq_lite::Origin::produce();
+    // Create separate origins for publishing and subscribing to avoid feedback loops.
+    // - publish_origin: Our local broadcasts (e.g., avatar/alice) - these get ANNOUNCEd to the relay
+    // - subscribe_origin: Proxied remote broadcasts (e.g., avatar/bob) - these are NOT announced
+    //
+    // If we used a single origin, the Publisher would see proxied remote broadcasts
+    // and try to re-ANNOUNCE them back to the relay, creating an infinite feedback loop.
+    let publish_origin = moq_lite::Origin::produce();
+    let subscribe_origin = moq_lite::Origin::produce();
 
-    // Connect with BOTH producer (for publishing) and consumer (for subscribing)
-    let session = moq_lite::Session::connect(session, origin.consumer.clone(), Some(origin.producer.clone())).await?;
+    // Connect with:
+    // - publish_origin.consumer: What we serve to remote subscribers (our local broadcasts)
+    // - subscribe_origin.producer: Where remote ANNOUNCEs get proxied to (for us to consume)
+    let session = moq_lite::Session::connect(
+        session,
+        publish_origin.consumer.clone(),
+        Some(subscribe_origin.producer.clone()),
+    ).await?;
 
     let stats = Arc::new(RwLock::new(Stats::new()));
 
-    // Spawn publisher task (publishes our avatar data)
+    // Spawn publisher task (publishes our avatar data to publish_origin)
     let _publisher_handle = tokio::spawn({
         let pub_config = pub_config.clone();
-        let origin_producer = origin.producer.clone();
+        let origin_producer = publish_origin.producer.clone();
         async move {
             if let Err(e) = run_publisher(pub_config, origin_producer).await {
                 tracing::error!("Publisher error: {:?}", e);
@@ -128,12 +140,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Spawn subscriber tasks for each remote client
+    // Spawn subscriber tasks for each remote client (consume from subscribe_origin)
     let _subscriber_handles: Vec<_> = subscribe_to
         .iter()
         .map(|remote_id| {
             let remote_id = remote_id.clone();
-            let origin_consumer = origin.consumer.clone();
+            let origin_consumer = subscribe_origin.consumer.clone();
             let stats = stats.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_subscriber(remote_id.clone(), origin_consumer, stats).await {
