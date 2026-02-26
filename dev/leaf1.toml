@@ -2,10 +2,12 @@
 
 [server]
 listen = "[::]:4444"
-tls.generate = ["localhost"]
+tls.generate = ["localhost", "100.81.137.8"]
 
-[web.http]
+[web.https]
 listen = "[::]:4444"
+cert = "dev/certs/cert.pem"
+key = "dev/certs/key.pem"
 
 [cluster]
 root = "localhost:4443"

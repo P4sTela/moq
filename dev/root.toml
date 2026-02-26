@@ -10,11 +10,12 @@ listen = "[::]:4443"
 
 # Generate a self-signed certificate for the given hostnames.
 # This is used for local development, in conjunction with a fingerprint, or with TLS verification disabled.
-tls.generate = ["localhost"]
+tls.generate = ["localhost", "100.81.137.8"]
 
 [web.http]
-# Listen for HTTP and WebSocket (TCP) connections on the given address.
-# Defaults to disabled if not provided.
+# Listen for HTTP and WebSocket connections on the given TCP address.
+# This serves certificate.sha256 for WebTransport fingerprint verification.
+# QUIC (UDP) and HTTP (TCP) can share the same port number.
 listen = "[::]:4443"
 
 # In production, we would use a real certificate from something like Let's Encrypt.

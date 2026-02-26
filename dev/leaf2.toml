@@ -3,10 +3,12 @@ level = "debug"
 
 [server]
 listen = "[::]:4445"
-tls.generate = ["localhost"]
+tls.generate = ["localhost", "100.81.137.8"]
 
-[web.http]
-listen = "[::]:8082"
+[web.https]
+listen = "[::]:4445"
+cert = "dev/certs/cert.pem"
+key = "dev/certs/key.pem"
 
 [cluster]
 connect = "localhost:4443"
