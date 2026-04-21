@@ -6,6 +6,7 @@ members = [
     "rs/moq-avatar",
     "rs/moq-clock",
     "rs/moq-lite",
+    "rs/moq-loadtest",
     "rs/moq-native",
     "rs/moq-relay",
     "rs/moq-token",
