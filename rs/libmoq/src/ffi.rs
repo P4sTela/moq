@@ -26,6 +26,67 @@ impl Callback {
 
 unsafe impl Send for Callback {}
 
+/// A callback that delivers a raw byte frame.
+///
+/// NOTE: `call` is invoked from the background tokio runtime thread, NOT the
+/// caller's thread. The C# side must marshal to its main thread as needed.
+/// The `data` pointer and `size` are only valid for the duration of the call.
+pub struct DataCallback {
+	user_data: *mut c_void,
+	on_data: Option<extern "C" fn(user_data: *mut c_void, data: *const u8, size: usize)>,
+}
+
+impl DataCallback {
+	pub unsafe fn new(
+		user_data: *mut c_void,
+		on_data: Option<extern "C" fn(user_data: *mut c_void, data: *const u8, size: usize)>,
+	) -> Self {
+		Self { user_data, on_data }
+	}
+
+	pub fn call(&self, data: &[u8]) {
+		if let Some(on_data) = &self.on_data {
+			on_data(self.user_data, data.as_ptr(), data.len());
+		}
+	}
+}
+
+// Safety: the C caller is responsible for ensuring user_data outlives the
+// subscription and is safe to access from the runtime thread.
+unsafe impl Send for DataCallback {}
+
+/// A callback that delivers broadcast (un)announcements.
+///
+/// NOTE: `call` is invoked from the background tokio runtime thread, NOT the
+/// caller's thread. `path` is a freshly-allocated null-terminated C string only
+/// valid for the duration of the call.
+pub struct AnnounceCallback {
+	user_data: *mut c_void,
+	on_announce: Option<extern "C" fn(user_data: *mut c_void, path: *const c_char, active: i32)>,
+}
+
+impl AnnounceCallback {
+	pub unsafe fn new(
+		user_data: *mut c_void,
+		on_announce: Option<extern "C" fn(user_data: *mut c_void, path: *const c_char, active: i32)>,
+	) -> Self {
+		Self {
+			user_data,
+			on_announce,
+		}
+	}
+
+	pub fn call(&self, path: &str, active: bool) {
+		if let Some(on_announce) = &self.on_announce {
+			// Allocate a null-terminated C string valid for the duration of the call.
+			let cstr = std::ffi::CString::new(path).unwrap_or_default();
+			on_announce(self.user_data, cstr.as_ptr(), active as i32);
+		}
+	}
+}
+
+unsafe impl Send for AnnounceCallback {}
+
 pub fn return_code<C: ReturnCode, F: FnOnce() -> C>(f: F) -> i32 {
 	match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
 		Ok(ret) => ret.code(),

@@ -13,11 +13,12 @@ categories = ["multimedia", "network-programming", "web-programming"]
 
 [lib]
 name = "moq"
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
+bytes = "1"
 hang = { workspace = true }
 moq-lite = { workspace = true, features = ["serde"] }
 moq-native = { workspace = true }
