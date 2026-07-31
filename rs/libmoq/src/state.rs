@@ -1,5 +1,11 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{
+	atomic::{AtomicBool, Ordering},
+	Arc,
+	LazyLock,
+	Mutex,
+	MutexGuard,
+};
 
 use tokio::sync::oneshot;
 use url::Url;
@@ -28,6 +34,11 @@ struct Session {
 	// A simple signal to notify the background task when closed.
 	#[allow(dead_code)]
 	closed: oneshot::Sender<()>,
+
+	// Disable the FFI callback before asking the background task to stop. This
+	// prevents a late Error::Closed callback from entering a torn-down Mono
+	// runtime during Unity process shutdown.
+	callback_active: Arc<AtomicBool>,
 }
 
 pub struct State {
@@ -122,9 +133,11 @@ impl State {
 
 		// Used just to notify when the session is removed from the map.
 		let closed = oneshot::channel();
+		let callback_active = callback.cancellation();
 
 		let id = self.sessions.insert(Session {
 			closed: closed.0,
+			callback_active,
 			origin: publish.producer,
 			// The consumer side is cloned cheaply by `consume()` when subscribing/announcing.
 			subscribe: subscribe.consumer,
@@ -163,7 +176,8 @@ impl State {
 	}
 
 	pub fn session_close(&mut self, id: Id) -> Result<(), Error> {
-		self.sessions.remove(id).ok_or(Error::NotFound)?;
+		let session = self.sessions.remove(id).ok_or(Error::NotFound)?;
+		session.callback_active.store(false, Ordering::Release);
 		Ok(())
 	}
 

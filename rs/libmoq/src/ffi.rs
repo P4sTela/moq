@@ -1,4 +1,7 @@
-use std::ffi::{c_char, c_void, CStr};
+use std::{
+	ffi::{c_char, c_void, CStr},
+	sync::{atomic::{AtomicBool, Ordering}, Arc},
+};
 
 use url::Url;
 
@@ -7,17 +10,33 @@ use crate::{Error, Id};
 pub struct Callback {
 	user_data: *mut c_void,
 	on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>,
+	active: Arc<AtomicBool>,
 }
 
 impl Callback {
-	pub unsafe fn new(
+	pub fn new(
 		user_data: *mut c_void,
 		on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>,
 	) -> Self {
-		Self { user_data, on_status }
+		Self {
+			user_data,
+			on_status,
+			active: Arc::new(AtomicBool::new(true)),
+		}
+	}
+
+	pub fn cancellation(&self) -> Arc<AtomicBool> {
+		self.active.clone()
+	}
+
+	pub fn disable(&self) {
+		self.active.store(false, Ordering::Release);
 	}
 
 	pub fn call<C: ReturnCode>(&mut self, ret: C) {
+		if !self.active.load(Ordering::Acquire) {
+			return;
+		}
 		if let Some(on_status) = &self.on_status {
 			on_status(self.user_data, ret.code());
 		}
@@ -37,7 +56,7 @@ pub struct DataCallback {
 }
 
 impl DataCallback {
-	pub unsafe fn new(
+	pub fn new(
 		user_data: *mut c_void,
 		on_data: Option<extern "C" fn(user_data: *mut c_void, data: *const u8, size: usize)>,
 	) -> Self {
@@ -66,7 +85,7 @@ pub struct AnnounceCallback {
 }
 
 impl AnnounceCallback {
-	pub unsafe fn new(
+	pub fn new(
 		user_data: *mut c_void,
 		on_announce: Option<extern "C" fn(user_data: *mut c_void, path: *const c_char, active: i32)>,
 	) -> Self {
