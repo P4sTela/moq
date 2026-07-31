@@ -91,6 +91,10 @@ impl Server {
 		let mut transport = quinn::TransportConfig::default();
 		transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
 		transport.keep_alive_interval(Some(Duration::from_secs(4)));
+		// A 64-peer MoQ client opens two long-lived bidirectional subscribe
+		// streams per remote peer. The QUIC default of 100 is therefore too
+		// small for 63 peers (126 streams), leaving later subscriptions queued.
+		transport.max_concurrent_bidi_streams(1024u32.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);

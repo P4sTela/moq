@@ -83,6 +83,7 @@ impl BroadcastProducer {
 		let mut state = self.state.lock();
 		let unique = state.published.insert(track.info.name.clone(), track.clone()).is_none();
 		let removed = state.requested.remove(&track.info.name).is_some();
+		tracing::debug!(track = %track.info.name, unique, removed, "broadcast track inserted");
 
 		unique && !removed
 	}
@@ -188,16 +189,29 @@ pub struct BroadcastConsumer {
 }
 
 impl BroadcastConsumer {
+	pub fn track_lookup_state(&self, name: &str) -> &'static str {
+		let state = self.state.lock();
+		if state.published.contains_key(name) {
+			"published"
+		} else if state.requested.contains_key(name) {
+			"requested_existing"
+		} else {
+			"requested_new"
+		}
+	}
+
 	pub fn subscribe_track(&self, track: &Track) -> TrackConsumer {
 		let mut state = self.state.lock();
 
 		// Return any explictly published track.
 		if let Some(consumer) = state.published.get(&track.name).cloned() {
+			tracing::debug!(track = %track.name, state = "published", "broadcast track lookup");
 			return consumer;
 		}
 
 		// Return any requested tracks.
 		if let Some(producer) = state.requested.get(&track.name) {
+			tracing::debug!(track = %track.name, state = "requested_existing", "broadcast track lookup");
 			return producer.consume();
 		}
 
@@ -219,6 +233,7 @@ impl BroadcastConsumer {
 		}
 
 		// Insert the producer into the lookup so we will deduplicate requests.
+		tracing::debug!(track = %producer.info.name, state = "requested_new", "broadcast track lookup");
 		state.requested.insert(producer.info.name.clone(), producer.clone());
 
 		// Remove the track from the lookup when it's unused.

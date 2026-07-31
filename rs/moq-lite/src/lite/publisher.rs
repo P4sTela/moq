@@ -190,7 +190,14 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		};
 
 		let broadcast = consumer.ok_or(Error::NotFound)?;
+		let lookup_state = broadcast.track_lookup_state(&track.name);
 		let track = broadcast.subscribe_track(&track);
+		tracing::debug!(
+			broadcast = %subscribe.broadcast,
+			track = %track.info.name,
+			lookup_state,
+			"resolved subscribed track",
+		);
 
 		// TODO wait until track.info() to get the *real* priority
 
