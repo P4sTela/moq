@@ -1,6 +1,9 @@
 use std::{
 	ffi::{c_char, c_void, CStr},
-	sync::{atomic::{AtomicBool, Ordering}, Arc},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc,
+	},
 };
 
 use url::Url;
@@ -14,10 +17,7 @@ pub struct Callback {
 }
 
 impl Callback {
-	pub fn new(
-		user_data: *mut c_void,
-		on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>,
-	) -> Self {
+	pub fn new(user_data: *mut c_void, on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>) -> Self {
 		Self {
 			user_data,
 			on_status,
@@ -89,10 +89,7 @@ impl AnnounceCallback {
 		user_data: *mut c_void,
 		on_announce: Option<extern "C" fn(user_data: *mut c_void, path: *const c_char, active: i32)>,
 	) -> Self {
-		Self {
-			user_data,
-			on_announce,
-		}
+		Self { user_data, on_announce }
 	}
 
 	pub fn call(&self, path: &str, active: bool) {
