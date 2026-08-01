@@ -123,9 +123,6 @@ impl Client {
 		let mut transport = quinn::TransportConfig::default();
 		transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
 		transport.keep_alive_interval(Some(time::Duration::from_secs(4)));
-		// Relay subscribers receive one unidirectional group stream per active track.
-		// Raise the peer-advertised limit for high-peer fanout.
-		transport.max_concurrent_uni_streams(1024u32.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);

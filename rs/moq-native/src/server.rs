@@ -95,9 +95,6 @@ impl Server {
 		// streams per remote peer. The QUIC default of 100 is therefore too
 		// small for 63 peers (126 streams), leaving later subscriptions queued.
 		transport.max_concurrent_bidi_streams(1024u32.into());
-		// A high-peer client also receives one unidirectional group stream per
-		// active track. The QUIC default is too small for 96-peer fanout.
-		transport.max_concurrent_uni_streams(1024u32.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);
