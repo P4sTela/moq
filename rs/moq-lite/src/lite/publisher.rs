@@ -276,6 +276,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 			// Spawn a task to serve this group, ignoring any errors because they don't really matter.
 			// TODO add some logging at least.
+			let first_group = old_group.is_none() && new_group.is_none();
 			let broadcast = subscribe.broadcast.to_string();
 			let track_name = track.info.name.clone();
 			let handle = Box::pin(Self::serve_group(
@@ -286,6 +287,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				version,
 				broadcast,
 				track_name,
+				first_group,
 			));
 
 			// Terminate the old group if it's still running.
@@ -317,6 +319,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		version: Version,
 		broadcast: String,
 		track: String,
+		first_group: bool,
 	) -> Result<(), Error> {
 		// TODO add a way to open in priority order.
 		let stream = session.open_uni().await.map_err(|err| {
@@ -330,7 +333,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			);
 			Error::Transport(Arc::new(err))
 		})?;
-		if msg.sequence == 0 {
+		if first_group {
 			tracing::debug!(
 				broadcast = %broadcast,
 				track = %track,
