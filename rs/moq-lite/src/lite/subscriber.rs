@@ -15,11 +15,19 @@ use tokio::sync::oneshot;
 use web_async::Lock;
 
 #[derive(Clone)]
+struct Subscription {
+	track: TrackProducer,
+	broadcast: PathOwned,
+	track_name: String,
+	first_group_received: bool,
+}
+
+#[derive(Clone)]
 pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	session: S,
 
 	origin: Option<OriginProducer>,
-	subscribes: Lock<HashMap<u64, TrackProducer>>,
+	subscribes: Lock<HashMap<u64, Subscription>>,
 	next_id: Arc<atomic::AtomicU64>,
 	version: Version,
 }
@@ -177,7 +185,15 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	}
 
 	async fn run_subscribe(&mut self, id: u64, broadcast: Path<'_>, track: TrackProducer) {
-		self.subscribes.lock().insert(id, track.clone());
+		self.subscribes.lock().insert(
+			id,
+			Subscription {
+				track: track.clone(),
+				broadcast: broadcast.to_owned(),
+				track_name: track.info.name.clone(),
+				first_group_received: false,
+			},
+		);
 
 		let msg = lite::Subscribe {
 			id,
@@ -241,13 +257,31 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	pub async fn recv_group(&mut self, stream: &mut Reader<S::RecvStream, Version>) -> Result<(), Error> {
 		let hdr: lite::Group = stream.decode().await?;
 
-		let group = {
+		let (group, first_group, broadcast, track_name) = {
 			let mut subs = self.subscribes.lock();
-			let track = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
+			let subscription = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
 
 			let group = Group { sequence: hdr.sequence };
-			track.create_group(group).ok_or(Error::Old)?
+			let group = subscription.track.create_group(group).ok_or(Error::Old)?;
+			let first_group = !subscription.first_group_received;
+			subscription.first_group_received = true;
+		(
+				group,
+				first_group,
+				subscription.broadcast.clone(),
+				subscription.track_name.clone(),
+			)
 		};
+
+		if first_group {
+			tracing::debug!(
+				broadcast = %broadcast,
+				track = %track_name,
+				subscribe = hdr.subscribe,
+				sequence = hdr.sequence,
+				"first group received",
+			);
+		}
 
 		let res = tokio::select! {
 			_ = group.unused() => Err(Error::Cancel),
