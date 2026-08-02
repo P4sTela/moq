@@ -20,6 +20,7 @@ struct Subscription {
 	broadcast: PathOwned,
 	track_name: String,
 	first_group_received: bool,
+	last_group_sequence: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -192,6 +193,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				broadcast: broadcast.to_owned(),
 				track_name: track.info.name.clone(),
 				first_group_received: false,
+				last_group_sequence: None,
 			},
 		);
 
@@ -257,22 +259,40 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	pub async fn recv_group(&mut self, stream: &mut Reader<S::RecvStream, Version>) -> Result<(), Error> {
 		let hdr: lite::Group = stream.decode().await?;
 
-		let (group, first_group, broadcast, track_name) = {
+		let (group, first_group, previous, broadcast, track_name) = {
 			let mut subs = self.subscribes.lock();
 			let subscription = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
 
 			let group = Group { sequence: hdr.sequence };
 			let group = subscription.track.create_group(group).ok_or(Error::Old)?;
 			let first_group = !subscription.first_group_received;
+			let previous = subscription.last_group_sequence;
 			subscription.first_group_received = true;
-		(
+			subscription.last_group_sequence = Some(
+				previous.map_or(hdr.sequence, |previous| previous.max(hdr.sequence)),
+			);
+			(
 				group,
 				first_group,
+				previous,
 				subscription.broadcast.clone(),
 				subscription.track_name.clone(),
 			)
 		};
 
+		if let Some(previous) = previous {
+			if hdr.sequence > previous.saturating_add(1) {
+				tracing::debug!(
+					broadcast = %broadcast,
+					track = %track_name,
+					subscribe = hdr.subscribe,
+					previous,
+					sequence = hdr.sequence,
+					skipped = hdr.sequence - previous - 1,
+					"incoming group sequence gap",
+				);
+			}
+		}
 		if first_group {
 			tracing::debug!(
 				broadcast = %broadcast,
