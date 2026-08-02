@@ -126,6 +126,8 @@ impl Client {
 		// Relay subscribes to both data and properties tracks on the client.
 		// Raise the peer-advertised bidi limit for high-peer fanout.
 		transport.max_concurrent_bidi_streams(1024u32.into());
+		// Relay subscribers also receive one unidirectional group stream per active track.
+		transport.max_concurrent_uni_streams(1024u32.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);
