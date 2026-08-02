@@ -1,3 +1,5 @@
+pub(crate) const MAX_CONCURRENT_UNI_STREAMS: u32 = 100;
+
 pub mod client;
 mod crypto;
 pub mod log;

@@ -1,4 +1,4 @@
-use crate::crypto;
+use crate::{crypto, MAX_CONCURRENT_UNI_STREAMS};
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::RootCertStore;
@@ -126,8 +126,10 @@ impl Client {
 		// Relay subscribes to both data and properties tracks on the client.
 		// Raise the peer-advertised bidi limit for high-peer fanout.
 		transport.max_concurrent_bidi_streams(1024u32.into());
-		// Relay subscribers also receive one unidirectional group stream per active track.
-		transport.max_concurrent_uni_streams(1024u32.into());
+		// A group is carried on a unidirectional stream. Bound incoming group
+		// streams so remote open_uni() calls wait instead of opening hundreds of
+		// concurrent group streams on one connection.
+		transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);

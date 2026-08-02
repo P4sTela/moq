@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{net, sync::Arc, time::Duration};
 
-use crate::crypto;
+use crate::{crypto, MAX_CONCURRENT_UNI_STREAMS};
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -95,8 +95,10 @@ impl Server {
 		// streams per remote peer. The QUIC default of 100 is therefore too
 		// small for 63 peers (126 streams), leaving later subscriptions queued.
 		transport.max_concurrent_bidi_streams(1024u32.into());
-		// Relay subscribers also receive one unidirectional group stream per active track.
-		transport.max_concurrent_uni_streams(1024u32.into());
+		// A group is carried on a unidirectional stream. Bound incoming group
+		// streams so remote open_uni() calls wait instead of opening hundreds of
+		// concurrent group streams on one connection.
+		transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);
