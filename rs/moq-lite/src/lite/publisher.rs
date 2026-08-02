@@ -235,6 +235,10 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let mut old_sequence = None;
 		let mut new_sequence = None;
 		let mut last_received_sequence: Option<u64> = None;
+		let mut group_count = 0u64;
+		let mut gap_count = 0u64;
+		let mut skipped_total = 0u64;
+		let mut max_skipped = 0u64;
 
 		// Keep reading groups from the track, some of which may arrive out of order.
 		loop {
@@ -253,18 +257,34 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					old_sequence = None;
 					continue;
 				},
-				else => return Ok(()),
+				else => {
+					tracing::info!(
+						broadcast = %subscribe.broadcast,
+						track = %track.info.name,
+						groups = group_count,
+						gap_count,
+						skipped_total,
+						max_skipped,
+						"outgoing group summary",
+					);
+					return Ok(());
+				},
 			}?;
 
 			let sequence = group.info.sequence;
+			group_count += 1;
 			if let Some(previous) = last_received_sequence {
 				if sequence > previous.saturating_add(1) {
+					let skipped = sequence - previous - 1;
+					gap_count += 1;
+					skipped_total += skipped;
+					max_skipped = max_skipped.max(skipped);
 					tracing::debug!(
 						broadcast = %subscribe.broadcast,
 						track = %track.info.name,
 						previous,
 						sequence,
-						skipped = sequence - previous - 1,
+						skipped,
 						"outgoing group sequence gap",
 					);
 				}

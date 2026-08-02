@@ -21,6 +21,10 @@ struct Subscription {
 	track_name: String,
 	first_group_received: bool,
 	last_group_sequence: Option<u64>,
+	group_count: u64,
+	gap_count: u64,
+	skipped_total: u64,
+	max_skipped: u64,
 }
 
 #[derive(Clone)]
@@ -194,6 +198,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				track_name: track.info.name.clone(),
 				first_group_received: false,
 				last_group_sequence: None,
+				group_count: 0,
+				gap_count: 0,
+				skipped_total: 0,
+				max_skipped: 0,
 			},
 		);
 
@@ -210,6 +218,30 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			_ = track.unused() => Err(Error::Cancel),
 			res = self.run_track(msg) => res,
 		};
+
+		let summary = self
+			.subscribes
+			.lock()
+			.get(&id)
+			.map(|subscription| {
+				(
+					subscription.group_count,
+					subscription.gap_count,
+					subscription.skipped_total,
+					subscription.max_skipped,
+				)
+			})
+			.unwrap_or_default();
+		tracing::info!(
+			id,
+			broadcast = %self.log_path(&broadcast),
+			track = %track.info.name,
+			groups = summary.0,
+			gap_count = summary.1,
+			skipped_total = summary.2,
+			max_skipped = summary.3,
+			"incoming group summary",
+		);
 
 		match res {
 			Err(Error::Cancel) | Err(Error::Transport(_)) => {
@@ -263,6 +295,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			let mut subs = self.subscribes.lock();
 			let subscription = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
 
+			subscription.group_count += 1;
 			let group = Group { sequence: hdr.sequence };
 			let group = subscription.track.create_group(group).ok_or(Error::Old)?;
 			let first_group = !subscription.first_group_received;
@@ -282,13 +315,20 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 
 		if let Some(previous) = previous {
 			if hdr.sequence > previous.saturating_add(1) {
+				let skipped = hdr.sequence - previous - 1;
+				let mut subs = self.subscribes.lock();
+				if let Some(subscription) = subs.get_mut(&hdr.subscribe) {
+					subscription.gap_count += 1;
+					subscription.skipped_total += skipped;
+					subscription.max_skipped = subscription.max_skipped.max(skipped);
+				}
 				tracing::debug!(
 					broadcast = %broadcast,
 					track = %track_name,
 					subscribe = hdr.subscribe,
 					previous,
 					sequence = hdr.sequence,
-					skipped = hdr.sequence - previous - 1,
+					skipped,
 					"incoming group sequence gap",
 				);
 			}
