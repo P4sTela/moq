@@ -276,7 +276,17 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 			// Spawn a task to serve this group, ignoring any errors because they don't really matter.
 			// TODO add some logging at least.
-			let handle = Box::pin(Self::serve_group(session.clone(), msg, priority, group, version));
+			let broadcast = subscribe.broadcast.to_string();
+			let track_name = track.info.name.clone();
+			let handle = Box::pin(Self::serve_group(
+				session.clone(),
+				msg,
+				priority,
+				group,
+				version,
+				broadcast,
+				track_name,
+			));
 
 			// Terminate the old group if it's still running.
 			if let Some(old_sequence) = old_sequence.take() {
@@ -305,12 +315,29 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		mut priority: PriorityHandle,
 		mut group: GroupConsumer,
 		version: Version,
+		broadcast: String,
+		track: String,
 	) -> Result<(), Error> {
 		// TODO add a way to open in priority order.
-		let stream = session
-			.open_uni()
-			.await
-			.map_err(|err| Error::Transport(Arc::new(err)))?;
+		let stream = session.open_uni().await.map_err(|err| {
+			tracing::warn!(
+				broadcast = %broadcast,
+				track = %track,
+				subscribe = msg.subscribe,
+				sequence = msg.sequence,
+				error = %err,
+				"group stream open failed",
+			);
+			Error::Transport(Arc::new(err))
+		})?;
+		if msg.sequence == 0 {
+			tracing::debug!(
+				broadcast = %broadcast,
+				track = %track,
+				subscribe = msg.subscribe,
+				"first group stream opened",
+			);
+		}
 
 		let mut stream = Writer::new(stream, version);
 		stream.set_priority(priority.current());
