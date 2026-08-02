@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{net, sync::Arc, time::Duration};
 
-use crate::{crypto, MAX_CONCURRENT_UNI_STREAMS};
+use crate::crypto;
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -67,6 +67,17 @@ pub struct ServerConfig {
 	#[arg(id = "server-bind", long = "server-bind", alias = "listen", env = "MOQ_SERVER_BIND")]
 	pub bind: Option<net::SocketAddr>,
 
+	/// Maximum unidirectional streams that the peer may open.
+	///
+	/// When unset, use the bounded relay-safe receive credit.
+	#[arg(
+		id = "server-max-concurrent-uni-streams",
+		long = "server-max-concurrent-uni-streams",
+		env = "MOQ_SERVER_MAX_CONCURRENT_UNI_STREAMS"
+	)]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub max_concurrent_uni_streams: Option<u32>,
+
 	#[command(flatten)]
 	#[serde(default)]
 	pub tls: ServerTlsConfig,
@@ -86,6 +97,8 @@ pub struct Server {
 
 impl Server {
 	pub fn new(config: ServerConfig) -> anyhow::Result<Self> {
+		let max_concurrent_uni_streams = crate::resolve_max_concurrent_uni_streams(config.max_concurrent_uni_streams)?;
+
 		// Enable BBR congestion control
 		// TODO Validate the BBR implementation before enabling it
 		let mut transport = quinn::TransportConfig::default();
@@ -95,10 +108,10 @@ impl Server {
 		// streams per remote peer. The QUIC default of 100 is therefore too
 		// small for 63 peers (126 streams), leaving later subscriptions queued.
 		transport.max_concurrent_bidi_streams(1024u32.into());
-		// A group is carried on a unidirectional stream. Bound incoming group
-		// streams so remote open_uni() calls wait instead of opening hundreds of
-		// concurrent group streams on one connection.
-		transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+		// A group is carried on a unidirectional stream. The bounded default
+		// makes remote open_uni() calls wait before one relay connection
+		// accumulates hundreds of concurrent group streams.
+		transport.max_concurrent_uni_streams(max_concurrent_uni_streams.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);

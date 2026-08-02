@@ -14,6 +14,10 @@ use moq_lite::AsPath;
 
 use crate::{ffi, Error, Id, NonZeroSlab};
 
+// Each FFI session can receive groups for the full peer fanout. Keep this
+// higher than the relay default while relays retain bounded cross-relay credit.
+const FFI_MAX_CONCURRENT_UNI_STREAMS: u32 = 1024;
+
 /// A pending or resolved subscription to a broadcast.
 ///
 /// We keep the scoped origin consumer and path so the spawned subscribe task
@@ -165,7 +169,10 @@ impl State {
 		subscribe: moq_lite::OriginProducer,
 		callback: &mut ffi::Callback,
 	) -> Result<(), Error> {
-		let config = moq_native::ClientConfig::default();
+		let config = moq_native::ClientConfig {
+			max_concurrent_uni_streams: Some(FFI_MAX_CONCURRENT_UNI_STREAMS),
+			..Default::default()
+		};
 		let client = config.init().map_err(|err| Error::Connect(Arc::new(err)))?;
 		let connection = client.connect(url).await.map_err(|err| Error::Connect(Arc::new(err)))?;
 		let session = moq_lite::Session::connect(connection, publish, subscribe).await?;

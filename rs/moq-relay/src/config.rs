@@ -62,3 +62,26 @@ impl Config {
 		Ok(config)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::Config;
+
+	#[test]
+	fn deserializes_role_specific_uni_stream_credits() {
+		let config: Config = toml::from_str(
+			r#"
+				[server]
+				listen = "127.0.0.1:4443"
+				max_concurrent_uni_streams = 100
+
+				[client]
+				max_concurrent_uni_streams = 1024
+			"#,
+		)
+		.unwrap_or_else(|err| panic!("failed to deserialize relay config: {err}"));
+
+		assert_eq!(config.server.max_concurrent_uni_streams, Some(100));
+		assert_eq!(config.client.max_concurrent_uni_streams, Some(1024));
+	}
+}

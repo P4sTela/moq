@@ -1,4 +1,4 @@
-use crate::{crypto, MAX_CONCURRENT_UNI_STREAMS};
+use crate::crypto;
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::RootCertStore;
@@ -42,6 +42,17 @@ pub struct ClientConfig {
 	)]
 	pub bind: net::SocketAddr,
 
+	/// Maximum unidirectional streams that the peer may open.
+	///
+	/// When unset, use the bounded relay-safe receive credit.
+	#[arg(
+		id = "client-max-concurrent-uni-streams",
+		long = "client-max-concurrent-uni-streams",
+		env = "MOQ_CLIENT_MAX_CONCURRENT_UNI_STREAMS"
+	)]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub max_concurrent_uni_streams: Option<u32>,
+
 	#[command(flatten)]
 	#[serde(default)]
 	pub tls: ClientTls,
@@ -51,6 +62,7 @@ impl Default for ClientConfig {
 	fn default() -> Self {
 		Self {
 			bind: "[::]:0".parse().unwrap(),
+			max_concurrent_uni_streams: None,
 			tls: ClientTls::default(),
 		}
 	}
@@ -71,6 +83,7 @@ pub struct Client {
 
 impl Client {
 	pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
+		let max_concurrent_uni_streams = crate::resolve_max_concurrent_uni_streams(config.max_concurrent_uni_streams)?;
 		let provider = crypto::provider();
 
 		// Create a list of acceptable root certificates.
@@ -126,10 +139,10 @@ impl Client {
 		// Relay subscribes to both data and properties tracks on the client.
 		// Raise the peer-advertised bidi limit for high-peer fanout.
 		transport.max_concurrent_bidi_streams(1024u32.into());
-		// A group is carried on a unidirectional stream. Bound incoming group
-		// streams so remote open_uni() calls wait instead of opening hundreds of
-		// concurrent group streams on one connection.
-		transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+		// A group is carried on a unidirectional stream. The bounded default
+		// makes remote open_uni() calls wait before one relay connection
+		// accumulates hundreds of concurrent group streams.
+		transport.max_concurrent_uni_streams(max_concurrent_uni_streams.into());
 		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);
