@@ -13,6 +13,29 @@ use crate::{
 	AsPath, BroadcastConsumer, Error, Origin, OriginConsumer, Track, TrackConsumer,
 };
 
+struct GroupSummary {
+	broadcast: String,
+	track: String,
+	groups: u64,
+	gap_count: u64,
+	skipped_total: u64,
+	max_skipped: u64,
+}
+
+impl Drop for GroupSummary {
+	fn drop(&mut self) {
+		tracing::info!(
+			broadcast = %self.broadcast,
+			track = %self.track,
+			groups = self.groups,
+			gap_count = self.gap_count,
+			skipped_total = self.skipped_total,
+			max_skipped = self.max_skipped,
+			"outgoing group summary",
+		);
+	}
+}
+
 pub(super) struct Publisher<S: web_transport_trait::Session> {
 	session: S,
 	origin: OriginConsumer,
@@ -235,10 +258,14 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let mut old_sequence = None;
 		let mut new_sequence = None;
 		let mut last_received_sequence: Option<u64> = None;
-		let mut group_count = 0u64;
-		let mut gap_count = 0u64;
-		let mut skipped_total = 0u64;
-		let mut max_skipped = 0u64;
+		let mut summary = GroupSummary {
+			broadcast: subscribe.broadcast.to_string(),
+			track: track.info.name.clone(),
+			groups: 0,
+			gap_count: 0,
+			skipped_total: 0,
+			max_skipped: 0,
+		};
 
 		// Keep reading groups from the track, some of which may arrive out of order.
 		loop {
@@ -257,28 +284,17 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					old_sequence = None;
 					continue;
 				},
-				else => {
-					tracing::info!(
-						broadcast = %subscribe.broadcast,
-						track = %track.info.name,
-						groups = group_count,
-						gap_count,
-						skipped_total,
-						max_skipped,
-						"outgoing group summary",
-					);
-					return Ok(());
-				},
+				else => return Ok(()),
 			}?;
 
 			let sequence = group.info.sequence;
-			group_count += 1;
+			summary.groups += 1;
 			if let Some(previous) = last_received_sequence {
 				if sequence > previous.saturating_add(1) {
 					let skipped = sequence - previous - 1;
-					gap_count += 1;
-					skipped_total += skipped;
-					max_skipped = max_skipped.max(skipped);
+					summary.gap_count += 1;
+					summary.skipped_total += skipped;
+					summary.max_skipped = summary.max_skipped.max(skipped);
 					tracing::debug!(
 						broadcast = %subscribe.broadcast,
 						track = %track.info.name,
