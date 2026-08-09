@@ -80,12 +80,67 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	tasks: Tasks,
 }
 
-#[derive(Clone)]
+/// Per-subscription group sequence telemetry emitted when the upstream wire
+/// subscription is removed. This matches the publisher-side summary fields.
+struct GroupSummary {
+	broadcast: PathOwned,
+	track: Arc<str>,
+	groups: u64,
+	gap_count: u64,
+	skipped_total: u64,
+	max_skipped: u64,
+	last_sequence: Option<u64>,
+}
+
+impl GroupSummary {
+	fn new(broadcast: PathOwned, track: Arc<str>) -> Self {
+		Self {
+			broadcast,
+			track,
+			groups: 0,
+			gap_count: 0,
+			skipped_total: 0,
+			max_skipped: 0,
+			last_sequence: None,
+		}
+	}
+
+	fn observe(&mut self, sequence: u64) {
+		self.groups += 1;
+		if let Some(previous) = self.last_sequence
+			&& sequence > previous.saturating_add(1)
+		{
+			let skipped = sequence - previous - 1;
+			self.gap_count += 1;
+			self.skipped_total += skipped;
+			self.max_skipped = self.max_skipped.max(skipped);
+		}
+		if self.last_sequence.is_none_or(|previous| sequence > previous) {
+			self.last_sequence = Some(sequence);
+		}
+	}
+}
+
+impl Drop for GroupSummary {
+	fn drop(&mut self) {
+		tracing::info!(
+			broadcast = %self.broadcast,
+			track = %self.track,
+			groups = self.groups,
+			gap_count = self.gap_count,
+			skipped_total = self.skipped_total,
+			max_skipped = self.max_skipped,
+			"incoming group summary",
+		);
+	}
+}
+
 struct TrackEntry {
 	producer: track::Producer,
 	/// Timestamp scale from this track's TRACK_INFO, known before the SUBSCRIBE is
 	/// even opened, so group streams decode frames without blocking.
 	timescale: Option<Timescale>,
+	summary: GroupSummary,
 }
 
 impl<S: web_transport_trait::Session> Subscriber<S> {
@@ -714,18 +769,21 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let mut buf = payload;
 		let dg = lite::Datagram::decode(&mut buf, self.version)?;
 
-		let mut entry = match self.subscribes.lock().get(&dg.subscribe) {
-			Some(entry) => entry.clone(),
-			// Unknown or already-closed subscription: drop the datagram.
-			None => return Ok(()),
+		let (mut producer, scale) = {
+			let subs = self.subscribes.lock();
+			let entry = match subs.get(&dg.subscribe) {
+				Some(entry) => entry,
+				// Unknown or already-closed subscription: drop the datagram.
+				None => return Ok(()),
+			};
+			(entry.producer.clone(), entry.timescale.unwrap_or_default())
 		};
 
 		// Datagrams are lite-05+, which always negotiates a timescale; default defensively.
-		let scale = entry.timescale.unwrap_or_default();
 		let timestamp =
 			Timestamp::new(dg.timestamp, scale).map_err(|_| Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
 
-		entry.producer.write_datagram(crate::Datagram {
+		producer.write_datagram(crate::Datagram {
 			sequence: dg.sequence,
 			timestamp,
 			payload: dg.payload,
@@ -739,6 +797,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let (mut group, track, timescale) = {
 			let mut subs = self.subscribes.lock();
 			let entry = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
+			entry.summary.observe(hdr.sequence);
 
 			let group_info = group::Info { sequence: hdr.sequence };
 			// Stats (groups/frames/bytes) are counted in the model as the group is
@@ -1394,6 +1453,7 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 			TrackEntry {
 				producer: producer.clone(),
 				timescale,
+				summary: GroupSummary::new(self.path.clone(), Arc::from(self.name.as_str())),
 			},
 		);
 

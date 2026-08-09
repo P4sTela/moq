@@ -49,6 +49,61 @@ struct SentRoute {
 	serving: bool,
 }
 
+/// Per-subscription group sequence telemetry emitted when the wire subscription ends.
+/// This is intentionally text-compatible with the existing relay group-summary parser.
+struct GroupSummary {
+	broadcast: Arc<str>,
+	track: Arc<str>,
+	groups: u64,
+	gap_count: u64,
+	skipped_total: u64,
+	max_skipped: u64,
+	last_sequence: Option<u64>,
+}
+
+impl GroupSummary {
+	fn new(broadcast: Arc<str>, track: Arc<str>) -> Self {
+		Self {
+			broadcast,
+			track,
+			groups: 0,
+			gap_count: 0,
+			skipped_total: 0,
+			max_skipped: 0,
+			last_sequence: None,
+		}
+	}
+
+	fn observe(&mut self, sequence: u64) {
+		self.groups += 1;
+		if let Some(previous) = self.last_sequence
+			&& sequence > previous.saturating_add(1)
+		{
+			let skipped = sequence - previous - 1;
+			self.gap_count += 1;
+			self.skipped_total += skipped;
+			self.max_skipped = self.max_skipped.max(skipped);
+		}
+		if self.last_sequence.is_none_or(|previous| sequence > previous) {
+			self.last_sequence = Some(sequence);
+		}
+	}
+}
+
+impl Drop for GroupSummary {
+	fn drop(&mut self) {
+		tracing::info!(
+			broadcast = %self.broadcast,
+			track = %self.track,
+			groups = self.groups,
+			gap_count = self.gap_count,
+			skipped_total = self.skipped_total,
+			max_skipped = self.max_skipped,
+			"outgoing group summary",
+		);
+	}
+}
+
 pub(super) struct PublisherConfig<S: web_transport_trait::Session> {
 	pub session: S,
 	/// The origin we read local broadcasts from. Traffic stats are attributed
@@ -972,6 +1027,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let sub = Subscription {
 			session,
 			id: subscribe.id,
+			broadcast: Arc::from(subscribe.broadcast.to_string()),
 			track_name: Arc::from(track.name()),
 			priority,
 			track_priority: track_priority_tx.consume(),
@@ -1833,6 +1889,7 @@ async fn recv_next(track: &mut track::Subscriber, datagrams: bool, emit_boundary
 struct Subscription<S: web_transport_trait::Session> {
 	session: S,
 	id: u64,
+	broadcast: Arc<str>,
 	track_name: Arc<str>,
 	priority: PriorityQueue,
 	track_priority: kio::Consumer<u8>,
@@ -1855,6 +1912,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		track_priority_tx: &kio::Producer<u8>,
 	) -> Result<(), Error> {
 		let mut tasks: FuturesUnordered<MaybeSendBox<'static, ()>> = FuturesUnordered::new();
+		let mut summary = GroupSummary::new(self.broadcast.clone(), self.track_name.clone());
 
 		// Start the consumer at the specified sequence, otherwise start at the latest group.
 		if let Some(start_group) = start_group.or_else(|| track.latest()) {
@@ -1916,6 +1974,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			match event {
 				Event::Recv(res) => match res? {
 					Recv::Group(group) => {
+						summary.observe(group.sequence);
 						if emit_range && !start_sent {
 							start_sent = true;
 							writer
@@ -2225,6 +2284,7 @@ mod serve_group_test {
 		let subscription = Subscription {
 			session,
 			id: 0,
+			broadcast: "test-broadcast".into(),
 			track_name: "test".into(),
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
