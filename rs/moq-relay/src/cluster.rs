@@ -348,6 +348,31 @@ pub struct ClusterConfig {
 	)]
 	#[serde(default, with = "humantime_serde")]
 	pub linger: Option<Duration>,
+
+	/// Restrict cluster sessions to one local namespace and one remote namespace.
+	///
+	/// When enabled, every static `connect` URL must carry a `?namespace=` query
+	/// naming the remote relay's namespace. The local relay publishes only under
+	/// [`Self::namespace`], and subscribes only to the namespace named by the peer
+	/// URL. This keeps a four-relay mesh's edge-local namespaces from being
+	/// transitively re-exported by an intermediate relay.
+	#[arg(
+		id = "cluster-namespace-filter",
+		long = "cluster-namespace-filter",
+		env = "MOQ_CLUSTER_NAMESPACE_FILTER",
+		default_missing_value = "true",
+		num_args = 0..=1,
+		require_equals = true,
+		value_parser = clap::value_parser!(bool),
+	)]
+	pub namespace_filter: Option<bool>,
+
+	/// The namespace owned by this relay when [`Self::namespace_filter`] is on.
+	///
+	/// This is an absolute path relative to the relay origin, for example
+	/// `room/<run-id>/area/area-north-west`.
+	#[arg(id = "cluster-namespace", long = "cluster-namespace", env = "MOQ_CLUSTER_NAMESPACE")]
+	pub namespace: Option<String>,
 }
 
 /// A relay cluster built around a single [`origin::Producer`].
@@ -491,6 +516,52 @@ impl Cluster {
 		crate::configured_tier(self.config.tier.clone())
 	}
 
+	fn namespace_filter_enabled(&self) -> bool {
+		self.config.namespace_filter.unwrap_or(false)
+	}
+
+	fn validate_namespace(value: &str, label: &str) -> anyhow::Result<()> {
+		anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
+		anyhow::ensure!(
+			!value.starts_with('/') && !value.ends_with('/'),
+			"{label} must be a relative origin path without a leading or trailing slash: {value:?}"
+		);
+		anyhow::ensure!(
+			Path::new(value).parts().next().is_some(),
+			"{label} must contain at least one path part"
+		);
+		Ok(())
+	}
+
+	fn namespace_filter_config(&self, gossip: bool) -> anyhow::Result<()> {
+		if !self.namespace_filter_enabled() {
+			return Ok(());
+		}
+
+		let local = self
+			.config
+			.namespace
+			.as_deref()
+			.context("cluster namespace filtering requires cluster.namespace")?;
+		Self::validate_namespace(local, "cluster.namespace")?;
+		anyhow::ensure!(
+			!gossip,
+			"cluster namespace filtering cannot be combined with cluster.mesh gossip"
+		);
+		anyhow::ensure!(
+			self.config.connect_api.is_none(),
+			"cluster namespace filtering cannot be combined with cluster.connect_api"
+		);
+		for peer in &self.config.connect {
+			let mut url = peer_url(peer)?;
+			take_cost(&mut url)?;
+			let remote = take_namespace(&mut url)?
+				.with_context(|| format!("namespace-filtered cluster peer {peer:?} is missing ?namespace=<path>"))?;
+			Self::validate_namespace(&remote, "cluster peer namespace")?;
+		}
+		Ok(())
+	}
+
 	/// Returns an [`origin::Producer`] scoped to this session's subscribe permissions.
 	///
 	/// Passed by reference to [`moq_net::Server::with_publisher`] (or the
@@ -546,6 +617,7 @@ impl Cluster {
 	/// to dial but no client was attached via [`with_client`](Self::with_client).
 	pub async fn run(self) -> anyhow::Result<()> {
 		let (gossip, node) = self.resolve_mesh()?;
+		self.namespace_filter_config(gossip)?;
 		anyhow::ensure!(
 			!gossip || node.is_some(),
 			"`--cluster-mesh` (gossip) requires `--cluster-node <self-url>` so there's an address to advertise. \
@@ -888,8 +960,13 @@ impl Cluster {
 		}
 	}
 
-	#[tracing::instrument("remote", skip_all, err, fields(%remote))]
 	async fn run_remote(self, remote: &str, token: String) -> anyhow::Result<()> {
+		self.run_remote_inner(remote, token)
+			.instrument(tracing::info_span!("remote", remote = %remote))
+			.await
+	}
+
+	async fn run_remote_inner(self, remote: &str, token: String) -> anyhow::Result<()> {
 		let mut url = peer_url(remote)?;
 		// The link's price, declared by us as the dialing side and charged to
 		// every announcement crossing the connection (see
@@ -898,6 +975,16 @@ impl Cluster {
 		// each price their links: 0 for a same-datacenter sibling, higher for a
 		// metered backbone. Stripped here; the value rides SETUP, not the URL.
 		let cost = take_cost(&mut url)?;
+		// Namespace is a local-only routing hint. It selects the remote origin
+		// scope for this session and is never sent as an application URL query.
+		let remote_namespace = take_namespace(&mut url)?;
+		if self.namespace_filter_enabled() {
+			let remote_namespace = remote_namespace
+				.as_deref()
+				.with_context(|| format!("namespace-filtered cluster peer {remote:?} is missing ?namespace=<path>"))?;
+			Self::validate_namespace(remote_namespace, "cluster peer namespace")?;
+		}
+
 		// Apply the shared cluster token unless the URL already carries its own
 		// non-empty `?jwt=` (an inline token on a static `connect` peer wins; the
 		// shared token still covers discovered peers that have none). An empty
@@ -917,7 +1004,7 @@ impl Cluster {
 
 		loop {
 			let started = tokio::time::Instant::now();
-			let result = self.run_remote_once(&url, cost).await;
+			let result = self.run_remote_once(&url, cost, remote_namespace.as_deref()).await;
 			let elapsed = started.elapsed();
 
 			match result {
@@ -936,16 +1023,27 @@ impl Cluster {
 		}
 	}
 
-	async fn run_remote_once(&self, url: &Url, cost: Option<u64>) -> anyhow::Result<()> {
+	async fn run_remote_once(
+		&self,
+		url: &Url,
+		cost: Option<u64>,
+		remote_namespace: Option<&str>,
+	) -> anyhow::Result<()> {
 		// Each attempt is its own session, so it gets its own id. Matches the span an
 		// accepted connection runs under, so both directions log the same way.
 		let id = self.next_connection_id();
-		self.run_remote_session(id, url, cost)
+		self.run_remote_session(id, url, cost, remote_namespace)
 			.instrument(tracing::info_span!("conn", id))
 			.await
 	}
 
-	async fn run_remote_session(&self, id: u64, url: &Url, cost: Option<u64>) -> anyhow::Result<()> {
+	async fn run_remote_session(
+		&self,
+		id: u64,
+		url: &Url,
+		cost: Option<u64>,
+		remote_namespace: Option<&str>,
+	) -> anyhow::Result<()> {
 		let mut log_url = url.clone();
 		log_url.set_query(None);
 		tracing::info!(url = %log_url, "dialing cluster peer");
@@ -958,10 +1056,28 @@ impl Cluster {
 
 		// Cluster dials use their configured stats tier. Cluster peers carry no auth
 		// root, so presence is keyed under the empty root within the cluster tier.
-		let mut client = client
-			.with_publisher(&self.origin)
-			.with_subscriber(self.origin.clone())
-			.with_stats(self.stats.tier(self.cluster_tier()).session(""));
+		let mut client = client.with_stats(self.stats.tier(self.cluster_tier()).session(""));
+		if self.namespace_filter_enabled() {
+			let local_namespace = self
+				.config
+				.namespace
+				.as_deref()
+				.expect("namespace filtering was validated before cluster tasks started");
+			let remote_namespace =
+				remote_namespace.expect("namespace filtering requires a remote namespace on every peer URL");
+			let publisher = self
+				.origin
+				.scope(&[Path::new(local_namespace)])
+				.context("failed to scope cluster publisher namespace")?;
+			let subscriber = self
+				.origin
+				.scope(&[Path::new(remote_namespace)])
+				.context("failed to scope cluster subscriber namespace")?;
+			tracing::info!(%local_namespace, %remote_namespace, "namespace-filtered cluster session");
+			client = client.with_publisher(publisher).with_subscriber(subscriber);
+		} else {
+			client = client.with_publisher(&self.origin).with_subscriber(self.origin.clone());
+		}
 		if let Some(cost) = cost {
 			client = client.with_cost(cost);
 		}
@@ -1006,6 +1122,35 @@ fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
 	}
 
 	Ok(Some(cost))
+}
+
+/// Extract and remove the local-only `namespace` query param from a peer URL.
+///
+/// Unlike `jwt`, this parameter is not an authentication input and must never
+/// reach the remote HTTP endpoint. Its value selects the remote relay origin
+/// scope for a namespace-filtered cluster session.
+fn take_namespace(url: &mut Url) -> anyhow::Result<Option<String>> {
+	let Some(value) = url
+		.query_pairs()
+		.find_map(|(key, value)| (key == "namespace").then(|| value.into_owned()))
+	else {
+		return Ok(None);
+	};
+
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "namespace")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (key, value) in &remaining {
+			pairs.append_pair(key, value);
+		}
+	}
+
+	Ok(Some(value))
 }
 
 /// Whether a `--cluster-connect-api` source is an http(s) URL (otherwise it's
@@ -1123,6 +1268,56 @@ mod tests {
 
 		let mut url = Url::parse("https://peer.example/?cost=cheap").unwrap();
 		assert!(take_cost(&mut url).is_err());
+	}
+
+	#[test]
+	fn namespace_param_is_consumed() {
+		let mut url = Url::parse("https://peer.example/?jwt=abc&namespace=room%2Frun%2Farea%2Fwest").unwrap();
+		assert_eq!(take_namespace(&mut url).unwrap().as_deref(), Some("room/run/area/west"));
+		assert_eq!(url.as_str(), "https://peer.example/?jwt=abc");
+
+		let mut url = Url::parse("https://peer.example/").unwrap();
+		assert_eq!(take_namespace(&mut url).unwrap(), None);
+		assert_eq!(url.as_str(), "https://peer.example/");
+	}
+
+	#[test]
+	fn namespace_filter_rejects_invalid_local_namespace() {
+		let mut config = ClusterConfig::default();
+		config.namespace_filter = Some(true);
+		config.namespace = Some("/absolute".to_string());
+		config.connect = vec!["https://peer.example/?namespace=remote".to_string()];
+		let cluster = Cluster::new(config).unwrap();
+		assert!(cluster.namespace_filter_config(false).is_err());
+	}
+
+	#[test]
+	fn namespace_filter_requires_remote_namespace() {
+		let mut config = ClusterConfig::default();
+		config.namespace_filter = Some(true);
+		config.namespace = Some("local".to_string());
+		config.connect = vec!["https://peer.example/".to_string()];
+		let cluster = Cluster::new(config).unwrap();
+		assert!(cluster.namespace_filter_config(false).is_err());
+	}
+
+	#[test]
+	fn namespace_filter_accepts_passive_leaf_without_outbound_peers() {
+		let mut config = ClusterConfig::default();
+		config.namespace_filter = Some(true);
+		config.namespace = Some("room/run/area/south-east".to_string());
+		let cluster = Cluster::new(config).unwrap();
+		cluster.namespace_filter_config(false).unwrap();
+	}
+
+	#[test]
+	fn namespace_filter_accepts_static_peer_scopes() {
+		let mut config = ClusterConfig::default();
+		config.namespace_filter = Some(true);
+		config.namespace = Some("room/run/area/west".to_string());
+		config.connect = vec!["https://peer.example/?namespace=room%2Frun%2Farea%2Feast".to_string()];
+		let cluster = Cluster::new(config).unwrap();
+		cluster.namespace_filter_config(false).unwrap();
 	}
 
 	#[test]

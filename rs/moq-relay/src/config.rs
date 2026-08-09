@@ -546,6 +546,48 @@ uid = [1001]
 	}
 
 	#[test]
+	fn cli_does_not_clobber_toml_cluster_namespace_filter() {
+		let _env = EnvGuard::clear(&["MOQ_CLUSTER_NAMESPACE_FILTER", "MOQ_CLUSTER_NAMESPACE"]);
+
+		let toml = r#"
+[cluster]
+namespace_filter = true
+namespace = "room/run/area/west"
+connect = ["https://peer.example/?namespace=room%2Frun%2Farea%2Feast"]
+"#;
+		let dir = std::env::temp_dir().join("moq-relay-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("namespace-filter-toml-wins.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = Config::parse_and_merge(args).expect("config load");
+
+		assert_eq!(config.cluster.namespace_filter, Some(true));
+		assert_eq!(config.cluster.namespace.as_deref(), Some("room/run/area/west"));
+		assert_eq!(config.cluster.connect.len(), 1);
+	}
+
+	#[test]
+	fn cli_flag_overrides_toml_cluster_namespace_filter() {
+		let _env = EnvGuard::clear(&["MOQ_CLUSTER_NAMESPACE_FILTER"]);
+
+		let toml = "[cluster]\nnamespace_filter = true\n";
+		let dir = std::env::temp_dir().join("moq-relay-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("namespace-filter-cli-wins.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![
+			std::ffi::OsString::from("moq-relay"),
+			std::ffi::OsString::from(&path),
+			std::ffi::OsString::from("--cluster-namespace-filter=false"),
+		];
+		let config = Config::parse_and_merge(args).expect("config load");
+		assert_eq!(config.cluster.namespace_filter, Some(false));
+	}
+
+	#[test]
 	fn cli_flag_overrides_toml_cluster_id() {
 		let _env = EnvGuard::clear(&["MOQ_CLUSTER_ID"]);
 
