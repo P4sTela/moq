@@ -15,6 +15,8 @@
 //!   that don't want to hit the customer port.
 //! - `/nodes` - the cluster nodes visible through gossip plus established
 //!   direct relay connections.
+//! - `/cluster/control-sessions` - structured connection-scoped telemetry for
+//!   observation-only outbound cluster dials.
 //!
 //! Everything here is unauthenticated, so bind it only to a trusted plane -
 //! loopback for a co-located scraper/agent, or a private overlay address; see
@@ -35,13 +37,16 @@ use axum::{
 };
 use clap::Parser;
 
+use crate::control_telemetry::{Registry as ControlSessionRegistry, Telemetry as ControlSessionTelemetry};
+
 /// Configuration for the internal (ops) listener.
 #[derive(Parser, Clone, Debug, serde::Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct InternalConfig {
 	/// Socket address for the internal listener (plain HTTP), serving the ops
-	/// endpoints (`/metrics`, `/health`, and `/nodes`).
+	/// endpoints (`/metrics`, `/health`, `/nodes`, and
+	/// `/cluster/control-sessions`).
 	///
 	/// These endpoints are unauthenticated, so bind it only to a trusted plane:
 	/// loopback (e.g. `127.0.0.1:9101`) for a co-located scraper/agent, or a
@@ -59,12 +64,14 @@ pub struct Internal {
 	config: InternalConfig,
 	stats: moq_net::stats::Registry,
 	nodes: Option<crate::nodes::Nodes>,
+	control_sessions: ControlSessionRegistry,
 }
 
 #[derive(Clone)]
 struct InternalState {
 	stats: moq_net::stats::Registry,
 	nodes: Option<crate::nodes::Nodes>,
+	control_sessions: ControlSessionRegistry,
 }
 
 impl Internal {
@@ -74,16 +81,19 @@ impl Internal {
 			config,
 			stats,
 			nodes: None,
+			control_sessions: ControlSessionRegistry::default(),
 		}
 	}
 
 	/// Attach the relay cluster used to serve the `/nodes` topology snapshot.
 	pub fn with_cluster(mut self, cluster: &crate::Cluster) -> Self {
 		self.nodes = Some(cluster.nodes.clone());
+		self.control_sessions = cluster.control_sessions.clone();
 		self
 	}
 
-	/// Build the ops router (`/metrics`, `/health`, and `/nodes`).
+	/// Build the ops router (`/metrics`, `/health`, `/nodes`, and
+	/// `/cluster/control-sessions`).
 	///
 	/// Exposed so embedders can mount it on their own listener.
 	pub fn routes(&self) -> Router {
@@ -91,9 +101,11 @@ impl Internal {
 			.route("/metrics", get(serve_metrics))
 			.route("/health", get(serve_health))
 			.route("/nodes", get(serve_nodes))
+			.route("/cluster/control-sessions", get(serve_control_sessions))
 			.with_state(InternalState {
 				stats: self.stats.clone(),
 				nodes: self.nodes.clone(),
+				control_sessions: self.control_sessions.clone(),
 			})
 	}
 
@@ -147,6 +159,11 @@ async fn serve_metrics(State(state): State<InternalState>) -> Response {
 /// unique match are omitted.
 async fn serve_nodes(State(state): State<InternalState>) -> Json<crate::nodes::Snapshot> {
 	Json(state.nodes.map(|nodes| nodes.snapshot()).unwrap_or_default())
+}
+
+/// Structured, connection-scoped telemetry for inbound and outbound control-only sessions.
+async fn serve_control_sessions(State(state): State<InternalState>) -> Json<ControlSessionTelemetry> {
+	Json(state.control_sessions.snapshot())
 }
 
 /// Render a [`moq_net::stats::Snapshot`] as Prometheus text exposition (v0.0.4).
@@ -263,6 +280,7 @@ mod tests {
 		let state = InternalState {
 			stats: moq_net::stats::Registry::disabled(),
 			nodes: None,
+			control_sessions: ControlSessionRegistry::default(),
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
@@ -277,10 +295,34 @@ mod tests {
 		let state = InternalState {
 			stats: moq_net::stats::Registry::disabled(),
 			nodes: Some(nodes),
+			control_sessions: ControlSessionRegistry::default(),
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
 		assert_eq!(snapshot.nodes[0].node, "https://relay-b.example/");
+	}
+
+	#[tokio::test]
+	async fn control_session_endpoint_exposes_structured_schema() {
+		let control_sessions = ControlSessionRegistry::default();
+		let _handle = control_sessions.begin(
+			7,
+			crate::control_telemetry::Direction::Outbound,
+			"https://relay-b.example/".to_string(),
+			Some("observation/diagonal/leaf1-leaf4".to_string()),
+			moq_net::stats::Registry::new(Default::default()),
+		);
+		let state = InternalState {
+			stats: moq_net::stats::Registry::disabled(),
+			nodes: None,
+			control_sessions,
+		};
+
+		let Json(payload) = serve_control_sessions(State(state)).await;
+		let value = serde_json::to_value(payload).expect("serialize control telemetry");
+		assert_eq!(value["schema_version"], 4);
+		assert_eq!(value["sessions"][0]["kind"], "control_only");
+		assert_eq!(value["sessions"][0]["state"], "connecting");
 	}
 
 	/// The `/metrics` renderer emits well-formed Prometheus exposition: a

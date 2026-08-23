@@ -6,6 +6,16 @@ use url::Url;
 
 use crate::{Error, Id, NonZeroSlab, State, ffi};
 
+fn parse_env_bool(value: &str) -> bool {
+	matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
+fn disable_tls_verification_from_env() -> bool {
+	std::env::var("MOQ_CLIENT_TLS_DISABLE_VERIFY")
+		.map(|value| parse_env_bool(&value))
+		.unwrap_or(false)
+}
+
 /// A spawned task entry: `close` signals shutdown, `callback` delivers status.
 ///
 /// `close` is an `Option` so `close()` can drop just the sender without
@@ -32,7 +42,15 @@ impl Session {
 		consume: Option<moq_net::origin::Producer>,
 		callback: ffi::OnStatus,
 	) -> Result<Id, Error> {
-		let mut client = moq_native::ClientConfig::default().init()?;
+		let mut client_config = moq_native::ClientConfig::default();
+		// The container runner already provides this opt-in for self-signed relay
+		// certificates. Keep the default secure, but make the FFI path honor the same
+		// setting as the native CLI so raw `moqt://` smoke runs do not need an HTTP
+		// fingerprint bootstrap.
+		if disable_tls_verification_from_env() {
+			client_config.tls.disable_verify = Some(true);
+		}
+		let mut client = client_config.init()?;
 		if let Some(publish) = &publish {
 			client = client.with_publisher(publish);
 		}
@@ -136,6 +154,16 @@ fn map_connect_error(err: moq_native::Error) -> Error {
 mod tests {
 	use super::*;
 	use crate::ffi::ReturnCode;
+
+	#[test]
+	fn parses_tls_disable_verify_env_values() {
+		for value in ["1", "true", "TRUE", "yes", "YES"] {
+			assert!(parse_env_bool(value), "{value}");
+		}
+		for value in ["0", "false", "no", ""] {
+			assert!(!parse_env_bool(value), "{value}");
+		}
+	}
 
 	#[test]
 	fn maps_native_auth_connect_errors() {

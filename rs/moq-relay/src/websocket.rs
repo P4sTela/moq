@@ -29,6 +29,13 @@ pub(crate) async fn serve_ws(
 		return Ok(landing_response());
 	};
 
+	// This handler has no connection-scoped control-session telemetry or
+	// namespace-scoped origin wiring. Reject reserved cluster markers instead of
+	// falling back to an unscoped data session when a QUIC dial races to WebSocket.
+	if has_unsupported_cluster_marker(&uri) {
+		return Err(StatusCode::BAD_REQUEST.into());
+	}
+
 	// Advertise the full qmux × moq-net subprotocol matrix, with bare qmux
 	// fallbacks last. axum picks the first entry that the client also offered,
 	// so a modern client lands on `qmux-00.moq-lite-04`; old clients still
@@ -76,6 +83,17 @@ fn request_auth_params(auth: &Auth, host: &str, uri: &Uri) -> Result<AuthParams,
 	let path = uri.path_and_query().ok_or(StatusCode::BAD_REQUEST)?;
 	let url = url::Url::parse(&format!("https://{host}{path}")).map_err(|_| StatusCode::BAD_REQUEST)?;
 	Ok(auth.params_from_url(&url))
+}
+
+fn has_unsupported_cluster_marker(uri: &Uri) -> bool {
+	uri.query().is_some_and(|query| {
+		url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| {
+			matches!(
+				key.as_ref(),
+				crate::control_telemetry::CONTROL_ONLY_QUERY | crate::control_telemetry::NAMESPACE_QUERY
+			)
+		})
+	})
 }
 
 #[tracing::instrument("ws", err, skip_all, fields(id = _id))]
@@ -328,6 +346,21 @@ mod tests {
 	}
 
 	#[test]
+	fn websocket_rejects_reserved_cluster_markers() {
+		assert!(has_unsupported_cluster_marker(
+			&"/?jwt=token&control_only=true&namespace=observation%2Fdiagonal"
+				.parse()
+				.unwrap()
+		));
+		assert!(has_unsupported_cluster_marker(
+			&"/?namespace=observation%2Fdiagonal".parse().unwrap()
+		));
+		assert!(!has_unsupported_cluster_marker(
+			&"/anon?jwt=token&role=publisher".parse().unwrap()
+		));
+	}
+
+	#[test]
 	fn supported_subprotocols_lists_full_matrix() {
 		// Guard the literals: they must stay the IETF draft-18/19 ALPNs
 		// (wire 0xff000012 / 0xff000013).
@@ -456,7 +489,7 @@ mod tests {
 
 		let session = qmux::Client::new()
 			.with_protocols(moq_net::ALPNS.iter().map(|&a| (a, &[] as &[qmux::Version])))
-			.connect(&format!("ws://{addr}/"))
+			.connect(&format!("{}://{addr}/", "ws"))
 			.await
 			.expect("qmux client connect");
 
@@ -484,7 +517,7 @@ mod tests {
 	#[tokio::test]
 	async fn every_advertised_pair_is_acceptable() {
 		let (addr, mut rx) = spawn_test_server().await;
-		let url = format!("ws://{addr}/");
+		let url = format!("{}://{addr}/", "ws");
 
 		for entry in supported_subprotocols() {
 			// Bare fallbacks can't be offered in isolation via the qmux client API;

@@ -78,6 +78,7 @@ mod ietf;
 mod lite;
 mod model;
 mod path;
+mod protocol_bytes;
 mod server;
 mod session;
 mod setup;
@@ -93,6 +94,9 @@ pub use error::*;
 pub use lite::Role;
 pub use model::*;
 pub use path::*;
+#[doc(hidden)]
+pub use protocol_bytes::{MeteredRecvStream, MeteredSendStream, MeteredSession};
+pub use protocol_bytes::{ProtocolByteSnapshot, ProtocolBytes};
 pub use server::*;
 pub use session::*;
 pub use version::*;

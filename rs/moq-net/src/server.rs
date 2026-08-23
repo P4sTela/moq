@@ -1,10 +1,13 @@
 use crate::origin;
 use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_LITE, ALPN_LITE_03, ALPN_LITE_04, ALPN_LITE_05,
-	ALPN_LITE_06_WIP, Consume, Driver, Error, NEGOTIATED, Role, Session, Version, Versions,
+	ALPN_LITE_06_WIP, Consume, Driver, Error, NEGOTIATED, ProtocolBytes, Role, Session, Version, Versions,
 	coding::{Decode, Encode, Reader, Stream},
-	ietf, lite, setup, stats,
+	ietf, lite,
+	protocol_bytes::MeteredSession,
+	setup, stats,
 };
+use web_transport_trait::Session as _;
 
 /// A MoQ server session builder.
 #[derive(Default, Clone)]
@@ -13,6 +16,7 @@ pub struct Server {
 	subscribe: Option<origin::Producer>,
 	stats: stats::Session,
 	versions: Versions,
+	protocol_bytes: Option<ProtocolBytes>,
 }
 
 impl Server {
@@ -43,6 +47,12 @@ impl Server {
 	/// Pass [`stats::Session::default`] (a no-op context) to opt out.
 	pub fn with_stats(mut self, stats: stats::Session) -> Self {
 		self.stats = stats;
+		self
+	}
+
+	/// Attach an opt-in counter for MoQ stream/datagram bytes.
+	pub fn with_protocol_bytes(mut self, bytes: ProtocolBytes) -> Self {
+		self.protocol_bytes = Some(bytes);
 		self
 	}
 
@@ -78,7 +88,12 @@ impl Server {
 	///
 	/// The path is surfaced for moq-lite-05 and every moq-transport draft we speak;
 	/// it's empty on versions with no in-band request path (e.g. lite 01-04).
-	pub async fn accept_request<S: web_transport_trait::Session>(&self, session: S) -> Result<Request<S>, Error> {
+	pub async fn accept_request<S: web_transport_trait::Session>(
+		&self,
+		session: S,
+	) -> Result<Request<MeteredSession<S>>, Error> {
+		let protocol_bytes = self.protocol_bytes.clone();
+		let session = MeteredSession::new(session, protocol_bytes);
 		// Regimes without a path to read defer to `ok()` without surfacing one, and
 		// carry no role or origin hint, so authorization is unchanged for them.
 		let deferred = |handshake| Request {
@@ -235,9 +250,9 @@ impl Server {
 	/// then pause. `ok()` starts the session and hands the stream back for GOAWAY.
 	async fn accept_ietf_modern<S: web_transport_trait::Session>(
 		&self,
-		session: S,
+		session: MeteredSession<S>,
 		version: ietf::Version,
-	) -> Result<Request<S>, Error> {
+	) -> Result<Request<MeteredSession<S>>, Error> {
 		let (peer_setup, path) = ietf::accept_setup(&session, version).await?;
 		Ok(Request {
 			path,
@@ -361,6 +376,23 @@ impl<S: web_transport_trait::Session> Request<S> {
 		self
 	}
 
+	/// Returns whether this request has either model data direction wired.
+	///
+	/// This is the server-side builder state immediately before [`ok`](Self::ok),
+	/// not a claim that application data has already crossed the session.
+	pub fn has_data_path(&self) -> bool {
+		self.inner
+			.as_ref()
+			.is_some_and(|inner| inner.server.publish.is_some() || inner.server.subscribe.is_some())
+	}
+
+	/// Returns the protocol byte counter attached before the handshake was parsed.
+	pub fn protocol_bytes(&self) -> Option<ProtocolBytes> {
+		self.inner
+			.as_ref()
+			.and_then(|inner| inner.server.protocol_bytes.clone())
+	}
+
 	fn inner_mut(&mut self) -> &mut RequestInner<S> {
 		self.inner.as_mut().expect("request already responded")
 	}
@@ -397,7 +429,13 @@ impl<S: web_transport_trait::Session> Request<S> {
 					Some(peer_setup),
 				)?;
 				tracing::debug!(?version, "connected");
-				return Ok(Session::new(session, version.into(), None, protocol));
+				return Ok(Session::new(
+					session,
+					version.into(),
+					None,
+					protocol,
+					server.protocol_bytes.clone(),
+				));
 			}
 			Handshake::LiteBare { session, version } => {
 				let start = lite::start(
@@ -415,6 +453,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					version.into(),
 					start.recv_bandwidth,
 					start.driver,
+					server.protocol_bytes.clone(),
 				));
 			}
 			Handshake::LiteSetup {
@@ -447,6 +486,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					version.into(),
 					start.recv_bandwidth,
 					start.driver,
+					server.protocol_bytes.clone(),
 				));
 			}
 			Handshake::Legacy {
@@ -509,7 +549,13 @@ impl<S: web_transport_trait::Session> Request<S> {
 			}
 		};
 
-		Ok(Session::new(session, version, recv_bw, protocol))
+		Ok(Session::new(
+			session,
+			version,
+			recv_bw,
+			protocol,
+			server.protocol_bytes.clone(),
+		))
 	}
 
 	/// Reject the session, closing the transport with `err`'s wire code.
@@ -716,6 +762,24 @@ mod tests {
 		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, None)]);
 		let request = Server::new().accept_request(session).await.unwrap();
 		assert_eq!(request.path(), "");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_request_meter_counts_ietf_setup_before_authorization() {
+		let setup = ietf_setup(ietf::Version::Draft19, Some("/team/room"));
+		let bytes = ProtocolBytes::enabled();
+		let request = Server::new()
+			.with_protocol_bytes(bytes.clone())
+			.accept_request(FakeSession::new(ALPN_19, [setup.clone()]))
+			.await
+			.unwrap();
+
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.bytes_received, setup.len() as u64);
+		assert_eq!(snapshot.control_bytes_received, setup.len() as u64);
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 0);
+		assert!(request.protocol_bytes().is_some());
 	}
 
 	#[tokio::test(start_paused = true)]

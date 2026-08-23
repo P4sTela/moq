@@ -301,7 +301,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 		// v17+: SETUP arrives on a uni stream, then becomes the GOAWAY channel.
 		// We accept it in the background without blocking, since there are no
 		// extensions that require waiting on the SETUP before proceeding.
-		if kind == setup::SETUP_V17 {
+		if matches!(version, Version::Draft17 | Version::Draft18 | Version::Draft19) && kind == setup::SETUP_V17 {
 			tasks.push(async move {
 				// Decode and discard the unified SETUP message.
 				if let Err(err) = reader.decode::<setup::Setup>().await {
@@ -322,7 +322,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 		let mut sub = subscriber.clone();
 		tasks.push(async move {
 			let mut reader = reader.with_version(version);
-			if let Err(err) = run_uni_group(&mut sub, &mut reader).await {
+			if let Err(err) = run_uni_group(&mut sub, &mut reader, version).await {
 				tracing::debug!(%err, "uni stream error");
 				reader.abort(&err);
 			}
@@ -333,15 +333,14 @@ async fn run_unis<S: web_transport_trait::Session>(
 async fn run_uni_group<S: web_transport_trait::Session>(
 	subscriber: &mut Subscriber<S>,
 	stream: &mut Reader<S::RecvStream, Version>,
+	version: Version,
 ) -> Result<(), Error> {
 	let kind: u64 = stream.decode_peek().await?;
 
-	// SUBGROUP_HEADER type bytes match the form 0b0XX1XXXX (spec §11.4.2):
-	// draft-14-17 use 0x10-0x1D and 0x30-0x3D, draft-18 adds 0x40 (FIRST_OBJECT)
-	// extending the form to also cover 0x50-0x5D and 0x70-0x7D. Per-version and
-	// per-bit validation (e.g., FIRST_OBJECT must be 0 on draft-17) is done in
-	// `GroupFlags::decode`.
-	if kind <= 0xff && (kind & 0x90) == 0x10 {
+	// Keep stream admission and byte-meter classification on the same per-version
+	// GroupFlags validator. This prevents a reserved or malformed type from being
+	// counted as data before the subscriber rejects it.
+	if super::is_group_stream_type(version, kind) {
 		return subscriber.recv_group(stream).await;
 	}
 

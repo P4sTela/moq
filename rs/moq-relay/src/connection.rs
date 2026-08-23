@@ -1,7 +1,8 @@
 use crate::{Auth, AuthError, AuthParams, AuthToken, Cluster};
 
 use axum::http;
-use moq_native::Request;
+use moq_native::{Request, Transport};
+use tracing::Instrument as _;
 
 /// An error carrying the HTTP status to send when closing the request.
 ///
@@ -38,9 +39,51 @@ pub struct Connection {
 
 impl Connection {
 	/// Authenticates and serves this connection until it closes.
-	#[tracing::instrument("conn", skip_all, fields(id = self.id))]
 	pub async fn run(self) -> anyhow::Result<()> {
+		let id = self.id;
+		async move { self.run_inner().await }
+			.instrument(tracing::info_span!("conn", id))
+			.await
+	}
+
+	async fn run_inner(self) -> anyhow::Result<()> {
 		let peer_origin = self.request.peer_origin();
+		let transport = self.request.transport();
+		// URL-less transports must carry an explicit request target in SETUP. Without
+		// one, Lite01-04 (which have no SETUP path) and pathless modern sessions would
+		// silently authenticate against the root. WebSocket is intentionally excluded:
+		// its URL is consumed by the WebSocket handshake and is not retained here.
+		if self.request.url().is_none()
+			&& matches!(
+				transport,
+				Transport::Quic | Transport::Iroh | Transport::Tcp | Transport::Unix
+			) && self.request.path().is_empty()
+		{
+			let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+			anyhow::bail!("URL-less request is missing a SETUP path");
+		}
+
+		// URL-bearing transports carry the local control-only markers in the dial URL.
+		// Raw QUIC and stream transports carry the same authenticated request target in
+		// SETUP, so recover the markers from Request::path() before authorization.
+		let (control_only, remote_namespace, peer_url) = match self.request.url() {
+			Some(url) => (
+				crate::control_telemetry::query_flag(url, crate::control_telemetry::CONTROL_ONLY_QUERY),
+				crate::control_telemetry::query_value(url, crate::control_telemetry::NAMESPACE_QUERY),
+				Some(crate::control_telemetry::sanitized_url(url)),
+			),
+			None => (
+				crate::control_telemetry::query_flag_in_path(
+					self.request.path(),
+					crate::control_telemetry::CONTROL_ONLY_QUERY,
+				),
+				crate::control_telemetry::query_value_in_path(
+					self.request.path(),
+					crate::control_telemetry::NAMESPACE_QUERY,
+				),
+				None,
+			),
+		};
 		let token = match self.authenticate().await {
 			Ok(token) => token,
 			Err(err) => {
@@ -51,8 +94,6 @@ impl Connection {
 
 		let publish = self.cluster.publisher(&token);
 		let subscribe = self.cluster.subscriber(&token);
-		let transport = self.request.transport();
-
 		// The client advertises which direction it intends to use (moq-lite-05 SETUP).
 		// A bidirectional connection (e.g. a cluster peer) advertises nothing, so the
 		// only requirement is that the token grants *something*. But a gateway that only
@@ -60,6 +101,36 @@ impl Connection {
 		// scope is rejected here during the handshake, instead of being accepted and
 		// then silently carrying no media (the bug that motivated the role hint).
 		let role = self.request.role();
+		let protocol_bytes = if control_only {
+			self.request.protocol_bytes()
+		} else {
+			None
+		};
+		if control_only {
+			if protocol_bytes.is_none() {
+				let _ = self
+					.request
+					.close(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+					.await;
+				anyhow::bail!("control-only session is missing protocol byte telemetry");
+			}
+			if !self.cluster.namespace_filter_enabled() {
+				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+				anyhow::bail!("control-only cluster sessions require namespace filtering");
+			}
+			let Some(remote_namespace) = remote_namespace.as_deref() else {
+				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+				anyhow::bail!("control-only cluster session is missing the namespace marker");
+			};
+			if let Err(error) = Cluster::validate_namespace(remote_namespace, "control-only namespace") {
+				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+				return Err(error);
+			}
+			if role.is_some() {
+				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+				anyhow::bail!("control-only cluster session must not advertise a data role");
+			}
+		}
 		let authorized = match role {
 			Some(moq_net::Role::Publisher) => publish.is_some(),
 			Some(moq_net::Role::Subscriber) => subscribe.is_some(),
@@ -73,25 +144,48 @@ impl Connection {
 			anyhow::bail!("token does not grant {wanted} access to {}", token.root);
 		}
 
-		match (&publish, &subscribe) {
-			(Some(publish), Some(subscribe)) => {
-				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
+		if control_only {
+			tracing::info!(
+				%transport,
+				?role,
+				tier = %token.tier,
+				root = %token.root,
+				remote_namespace = ?remote_namespace,
+				"control-only session accepted"
+			);
+		} else {
+			match (&publish, &subscribe) {
+				(Some(publish), Some(subscribe)) => {
+					tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
+				}
+				(Some(publish), None) => {
+					tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "publisher accepted");
+				}
+				(None, Some(subscribe)) => {
+					tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "subscriber accepted")
+				}
+				_ => unreachable!("authorized above guarantees at least one origin"),
 			}
-			(Some(publish), None) => {
-				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "publisher accepted");
-			}
-			(None, Some(subscribe)) => {
-				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "subscriber accepted")
-			}
-			_ => unreachable!("authorized above guarantees at least one origin"),
 		}
 
-		// Build this session's stats context under its billing tier and auth root.
-		// The context carries the presence gauge (a client that merely connects to
-		// e.g. `/acme` is counted, even idle) and drives the model-layer counters
-		// once it tags the session's origin pair below. It closes when the last
-		// clone drops (the connection ends).
-		let stats = self.cluster.stats.tier(token.tier.clone()).session(&token.root);
+		// Keep observation-only model counters in a private registry. This makes an
+		// inbound control-only record symmetric with the outbound record and prevents
+		// relay-wide application traffic from contaminating the evidence.
+		let mut telemetry = None;
+		let stats = if control_only {
+			let model_registry = moq_net::stats::Registry::new(Default::default());
+			let model_session = model_registry.tier(self.cluster.cluster_tier()).session("");
+			telemetry = Some(self.cluster.control_sessions.begin(
+				self.id,
+				crate::control_telemetry::Direction::Inbound,
+				peer_url.unwrap_or_else(|| format!("transport:{transport}")),
+				remote_namespace,
+				model_registry,
+			));
+			model_session
+		} else {
+			self.cluster.stats.tier(token.tier.clone()).session(&token.root)
+		};
 
 		// Wire only the direction(s) the client will actually use. The token scope
 		// (enforced above) caps what it *may* do; the role caps what it *will* do.
@@ -112,15 +206,32 @@ impl Connection {
 		// We subscribe to the tracks the client is allowed to publish.
 		//
 		// moq-net defaults the unset side to a fresh no-op origin, which is fine for a
-		// publish-only or subscribe-only session.
+		// publish-only or subscribe-only session. Control-only sessions intentionally
+		// leave both sides unset.
 		let mut request = self.request.with_stats(stats);
-		if let Some(subscribe) = subscribe {
-			request = request.with_publisher(&subscribe);
+		if !control_only {
+			if let Some(subscribe) = subscribe {
+				request = request.with_publisher(&subscribe);
+			}
+			if let Some(publish) = publish {
+				request = request.with_subscriber(publish);
+			}
 		}
-		if let Some(publish) = publish {
-			request = request.with_subscriber(publish);
+		if let Some(telemetry) = &telemetry {
+			telemetry.set_data_path_attached(request.has_data_path());
 		}
-		let session = request.ok().await?;
+		let session = match request.ok().await {
+			Ok(session) => session,
+			Err(error) => {
+				if let Some(mut telemetry) = telemetry {
+					telemetry.finish(crate::control_telemetry::State::Failed, Some(error.to_string()));
+				}
+				return Err(error.into());
+			}
+		};
+		if let Some(telemetry) = &telemetry {
+			telemetry.connected(&session);
+		}
 		let _node_connection = peer_origin.map(|origin| self.cluster.nodes.connect_inbound(self.id, origin));
 
 		tracing::info!(version = %session.version(), %transport, "negotiated");
@@ -128,19 +239,27 @@ impl Connection {
 		// The credential (JWT `exp` or client cert `notAfter`) is only checked at
 		// connect time, so hold the session open no longer than the credential is
 		// valid. Without an expiry, just wait for the session to close.
-		let Some(expires) = token.expires else {
-			return Err(session.closed().await.into());
-		};
-
-		let remaining = expires.duration_since(std::time::SystemTime::now()).unwrap_or_default();
-		match tokio::time::timeout(remaining, session.closed()).await {
-			Ok(err) => Err(err.into()),
-			Err(_) => {
-				tracing::info!("credential expired, closing session");
-				session.abort(moq_net::Error::Unauthorized);
-				Ok(())
+		let result: anyhow::Result<()> = match token.expires {
+			None => Err(session.closed().await.into()),
+			Some(expires) => {
+				let remaining = expires.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+				match tokio::time::timeout(remaining, session.closed()).await {
+					Ok(err) => Err(err.into()),
+					Err(_) => {
+						tracing::info!("credential expired, closing session");
+						session.abort(moq_net::Error::Unauthorized);
+						Ok(())
+					}
+				}
 			}
+		};
+		if let Some(mut telemetry) = telemetry {
+			telemetry.finish(
+				crate::control_telemetry::State::Closed,
+				result.as_ref().err().map(|error| error.to_string()),
+			);
 		}
+		result
 	}
 
 	/// Resolve an [`AuthToken`] for this connection. Any failure is returned as a

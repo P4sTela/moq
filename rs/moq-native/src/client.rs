@@ -45,7 +45,7 @@ pub struct ClientConfig {
 	/// Use this to force a specific version, e.g. `--client-version moq-lite-02`.
 	/// Can be specified multiple times to offer a subset of versions.
 	///
-	/// Valid values: moq-lite-01, moq-lite-02, moq-lite-03, moq-transport-14, moq-transport-15, moq-transport-16, moq-transport-17
+	/// Valid values: moq-lite-01, moq-lite-02, moq-lite-03, moq-transport-14 through moq-transport-19
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[arg(id = "client-version", long = "client-version", env = "MOQ_CLIENT_VERSION")]
 	pub version: Vec<moq_net::Version>,
@@ -243,6 +243,20 @@ impl Client {
 	pub fn with_stats(mut self, stats: moq_net::stats::Session) -> Self {
 		self.moq = self.moq.with_stats(stats);
 		self
+	}
+
+	/// Attach an opt-in counter for MoQ stream/datagram bytes.
+	pub fn with_protocol_bytes(mut self, bytes: moq_net::ProtocolBytes) -> Self {
+		self.moq = self.moq.with_protocol_bytes(bytes);
+		self
+	}
+
+	/// Returns whether either model data direction is configured for this client.
+	///
+	/// This reports the builder wiring before [`connect`](Self::connect), not whether
+	/// the peer has actually announced or delivered application data.
+	pub fn has_data_path(&self) -> bool {
+		self.moq.has_data_path()
 	}
 
 	/// Price the links this client dials; see [`moq_net::Client::with_cost`].

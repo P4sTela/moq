@@ -9,7 +9,7 @@ use std::{
 use web_transport_trait::Stats;
 
 use crate::{
-	Error, Version, bandwidth,
+	Error, ProtocolByteSnapshot, ProtocolBytes, Version, bandwidth,
 	util::{MaybeBoxedExt, MaybeSendBox},
 };
 
@@ -68,6 +68,7 @@ pub struct Session {
 	version: Version,
 	send_bandwidth: Option<bandwidth::Consumer>,
 	recv_bandwidth: Option<bandwidth::Consumer>,
+	protocol_bytes: Option<ProtocolBytes>,
 }
 
 impl Session {
@@ -98,6 +99,11 @@ impl Session {
 		let mut stats = self.shared.inner.stats();
 		stats.estimated_recv_rate = self.recv_bandwidth.as_ref().and_then(bandwidth::Consumer::peek);
 		stats
+	}
+
+	/// Returns the optional MoQ application-stream byte snapshot.
+	pub fn protocol_bytes(&self) -> Option<ProtocolByteSnapshot> {
+		self.protocol_bytes.as_ref().map(ProtocolBytes::snapshot)
 	}
 
 	/// Close the transport with an explicit error, instead of waiting for the last
@@ -220,6 +226,7 @@ impl Session {
 		version: Version,
 		recv_bandwidth: Option<bandwidth::Consumer>,
 		protocol: MaybeSendBox<'static, Result<(), Error>>,
+		protocol_bytes: Option<ProtocolBytes>,
 	) -> (Self, Driver) {
 		// Send bandwidth is version-agnostic: it depends on QUIC backend support.
 		let (send_bandwidth, maintenance) = if session.stats().estimated_send_rate().is_some() {
@@ -242,6 +249,7 @@ impl Session {
 			version,
 			send_bandwidth,
 			recv_bandwidth,
+			protocol_bytes,
 		};
 		let driver = Driver {
 			protocol,

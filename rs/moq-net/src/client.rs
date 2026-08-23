@@ -1,10 +1,13 @@
 use crate::origin;
 use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_LITE, ALPN_LITE_03, ALPN_LITE_04, ALPN_LITE_05,
-	ALPN_LITE_06_WIP, Consume, Driver, Error, NEGOTIATED, Session, Version, Versions,
+	ALPN_LITE_06_WIP, Consume, Driver, Error, NEGOTIATED, ProtocolBytes, Session, Version, Versions,
 	coding::{self, Decode, Encode, Stream},
-	ietf, lite, setup, stats,
+	ietf, lite,
+	protocol_bytes::MeteredSession,
+	setup, stats,
 };
+use web_transport_trait::Session as _;
 
 /// A MoQ client session builder.
 #[derive(Default, Clone)]
@@ -16,6 +19,7 @@ pub struct Client {
 	setup_path: Option<String>,
 	cost: Option<u64>,
 	peer_origin: Option<crate::Origin>,
+	protocol_bytes: Option<ProtocolBytes>,
 }
 
 impl Client {
@@ -46,6 +50,20 @@ impl Client {
 	pub fn with_stats(mut self, stats: stats::Session) -> Self {
 		self.stats = stats;
 		self
+	}
+
+	/// Attach an opt-in counter for MoQ stream/datagram bytes.
+	pub fn with_protocol_bytes(mut self, bytes: ProtocolBytes) -> Self {
+		self.protocol_bytes = Some(bytes);
+		self
+	}
+
+	/// Returns whether this client is configured with either model data direction.
+	///
+	/// This reports the builder wiring before [`connect`](Self::connect), not whether
+	/// the peer has actually announced or delivered application data.
+	pub fn has_data_path(&self) -> bool {
+		self.publish.is_some() || self.subscribe.is_some()
 	}
 
 	/// Set both publish and subscribe from one shared [`origin::Producer`].
@@ -122,6 +140,8 @@ impl Client {
 	/// runs its protocol work. The driver must be polled (spawned or awaited) for
 	/// the session to make progress.
 	pub async fn connect<S: web_transport_trait::Session>(&self, session: S) -> Result<(Session, Driver), Error> {
+		let protocol_bytes = self.protocol_bytes.clone();
+		let session = MeteredSession::new(session, protocol_bytes.clone());
 		if self.publish.is_none() && self.subscribe.is_none() {
 			tracing::warn!("not publishing or consuming anything");
 		}
@@ -169,7 +189,7 @@ impl Client {
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None, protocol));
+				return Ok(Session::new(session, v, None, protocol, protocol_bytes.clone()));
 			}
 			Some(ALPN_18) => {
 				let v = self
@@ -193,7 +213,7 @@ impl Client {
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None, protocol));
+				return Ok(Session::new(session, v, None, protocol, protocol_bytes.clone()));
 			}
 			Some(ALPN_17) => {
 				let v = self
@@ -217,7 +237,7 @@ impl Client {
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None, protocol));
+				return Ok(Session::new(session, v, None, protocol, protocol_bytes.clone()));
 			}
 			Some(ALPN_16) => {
 				let v = self
@@ -274,7 +294,13 @@ impl Client {
 				// Block until the initial announce set has landed (Lite05+ reports it
 				// via AnnounceOk + N), so a `request_broadcast()` for a live path resolves
 				// immediately instead of racing announcement gossip.
-				let (session, mut driver) = Session::new(session, version.into(), start.recv_bandwidth, start.driver);
+				let (session, mut driver) = Session::new(
+					session,
+					version.into(),
+					start.recv_bandwidth,
+					start.driver,
+					protocol_bytes.clone(),
+				);
 				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
 
 				return Ok((session, driver));
@@ -301,6 +327,7 @@ impl Client {
 					lite::Version::Lite04.into(),
 					start.recv_bandwidth,
 					start.driver,
+					protocol_bytes.clone(),
 				);
 				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
 
@@ -329,6 +356,7 @@ impl Client {
 					lite::Version::Lite03.into(),
 					start.recv_bandwidth,
 					start.driver,
+					protocol_bytes.clone(),
 				);
 				driver.wait_ready(|waiter| start.connecting.poll_ready(waiter)).await;
 
@@ -413,7 +441,7 @@ impl Client {
 			}
 		};
 
-		let (session, mut driver) = Session::new(session, version, recv_bw, protocol);
+		let (session, mut driver) = Session::new(session, version, recv_bw, protocol, protocol_bytes.clone());
 		if let Some(connecting) = connecting {
 			// Block until the initial announce set has landed (for versions that
 			// report one); resolves immediately otherwise.
@@ -434,6 +462,13 @@ mod tests {
 
 	use crate::coding::{Decode, Encode};
 	use bytes::{BufMut, Bytes};
+
+	#[test]
+	fn has_data_path_reflects_builder_wiring() {
+		assert!(!Client::new().has_data_path());
+		let origin = crate::Origin::new(100).unwrap().produce();
+		assert!(Client::new().with_subscriber(origin).has_data_path());
+	}
 
 	#[derive(Debug, Clone, Default)]
 	struct FakeError;
@@ -643,6 +678,19 @@ mod tests {
 		encoded
 	}
 
+	fn mock_ietf_server_setup(version: Version) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		setup::Server {
+			version: version.into(),
+			parameters: ietf::Parameters::default()
+				.encode_bytes(ietf::Version::Draft14)
+				.unwrap(),
+		}
+		.encode(&mut encoded, Version::Ietf(ietf::Version::Draft14))
+		.unwrap();
+		encoded
+	}
+
 	async fn run_alpn_lite_fallback_case(protocol: Option<&'static str>) {
 		let fake = FakeSession::new(protocol, mock_server_setup(Version::Lite(lite::Version::Lite01)));
 		let client = Client::new().with_versions(
@@ -688,6 +736,37 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn no_alpn_falls_back_to_draft14_and_switches_version_post_setup() {
 		run_alpn_lite_fallback_case(None).await;
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn connect_meter_counts_setup_bytes_without_data_bytes() {
+		let fake = FakeSession::new(
+			Some(ALPN_14),
+			mock_ietf_server_setup(Version::Ietf(ietf::Version::Draft14)),
+		);
+		let bytes = ProtocolBytes::enabled();
+		let client = Client::new()
+			.with_versions(
+				[
+					Version::Lite(lite::Version::Lite03),
+					Version::Lite(lite::Version::Lite02),
+					Version::Lite(lite::Version::Lite01),
+					Version::Ietf(ietf::Version::Draft14),
+				]
+				.into(),
+			)
+			.with_protocol_bytes(bytes.clone());
+
+		let _connection = client.connect(fake).await.unwrap();
+		let snapshot = bytes.snapshot();
+		assert!(snapshot.bytes_sent > 0, "client SETUP write was not metered");
+		assert!(snapshot.bytes_received > 0, "server SETUP read was not metered");
+		assert_eq!(snapshot.bytes_sent, snapshot.control_bytes_sent);
+		assert_eq!(snapshot.bytes_received, snapshot.control_bytes_received);
+		assert_eq!(snapshot.data_bytes_sent, 0);
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_sent, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 0);
 	}
 
 	// This fake reports no send-rate estimate, so it never reaches the tokio timer in

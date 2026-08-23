@@ -1,6 +1,7 @@
 use std::net;
 #[cfg(any(test, all(feature = "uds", unix)))]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(feature = "iroh")]
 use crate::iroh;
@@ -60,7 +61,7 @@ pub struct ServerConfig {
 	/// Use this to restrict to specific versions, e.g. `--server-version moq-lite-02`.
 	/// Can be specified multiple times to accept a subset of versions.
 	///
-	/// Valid values: moq-lite-01, moq-lite-02, moq-lite-03, moq-transport-14, moq-transport-15, moq-transport-16
+	/// Valid values: moq-lite-01, moq-lite-02, moq-lite-03, moq-transport-14 through moq-transport-19
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[arg(id = "server-version", long = "server-version", env = "MOQ_SERVER_VERSION")]
 	pub version: Vec<moq_net::Version>,
@@ -109,6 +110,8 @@ impl ServerConfig {
 /// Default bind address used when [`ServerConfig::bind`] is not set.
 pub(crate) const DEFAULT_BIND: &str = "[::]:443";
 
+type ProtocolBytesFactory = Arc<dyn Fn(Option<&Url>) -> Option<moq_net::ProtocolBytes> + Send + Sync>;
+
 /// Server for accepting MoQ connections.
 ///
 /// Accepts QUIC (and optionally WebSocket), plus plaintext qmux over TCP
@@ -117,6 +120,7 @@ pub(crate) const DEFAULT_BIND: &str = "[::]:443";
 pub struct Server {
 	moq: moq_net::Server,
 	versions: moq_net::Versions,
+	protocol_bytes_factory: Option<ProtocolBytesFactory>,
 	accept: FuturesUnordered<BoxFuture<'static, crate::Result<Request>>>,
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 	streams: StreamListeners,
@@ -211,6 +215,7 @@ impl Server {
 			accept: Default::default(),
 			moq: moq_net::Server::new().with_versions(versions.clone()),
 			versions,
+			protocol_bytes_factory: None,
 			#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 			streams,
 			#[cfg(feature = "iroh")]
@@ -260,6 +265,21 @@ impl Server {
 	/// accepted by this server.
 	pub fn with_stats(mut self, stats: moq_net::stats::Session) -> Self {
 		self.moq = self.moq.with_stats(stats);
+		self
+	}
+
+	/// Create a per-accepted-session MoQ byte counter before SETUP parsing.
+	///
+	/// Returning `None` keeps the default no-op path. The callback receives the URL
+	/// for URL-bearing transports; URL-less transports pass `None`.
+	pub fn with_protocol_bytes_factory(
+		mut self,
+		factory: impl Fn(Option<&Url>) -> Option<moq_net::ProtocolBytes> + Send + Sync + 'static,
+	) -> Self {
+		let factory = Arc::new(factory);
+		self.protocol_bytes_factory = Some(factory.clone());
+		#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
+		self.streams.with_protocol_bytes_factory(Some(factory));
 		self
 	}
 
@@ -421,6 +441,8 @@ impl Server {
 			let server = self.moq.clone();
 			#[allow(unused_variables)]
 			let versions = self.versions.clone();
+			#[allow(unused_variables)]
+			let protocol_bytes_factory = self.protocol_bytes_factory.clone();
 
 			// No streams configured: never resolves, so it doesn't disturb select!.
 			#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
@@ -436,11 +458,17 @@ impl Server {
 					#[cfg(feature = "noq")]
 					{
 						let alpns = versions.alpns();
+						let server = server.clone();
+						let protocol_bytes_factory = protocol_bytes_factory.clone();
 						self.accept.push(async move {
 							// Accept the transport (capturing url + mTLS identity) and exchange the
 							// MoQ SETUP up front, so path/role are known before the caller authorizes
 							// (like the stream bindings).
 							let (session, url, identity) = super::noq::accept(_conn, alpns).await?;
+							let server = protocol_bytes_factory
+								.as_ref()
+								.and_then(|factory| factory(url.as_ref()))
+								.map_or_else(|| server.clone(), |bytes| server.clone().with_protocol_bytes(bytes));
 							let request = server.accept_request(session).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Noq(Box::new(request)) })
 						}.boxed());
@@ -450,8 +478,14 @@ impl Server {
 					#[cfg(feature = "quinn")]
 					{
 						let alpns = versions.alpns();
+						let server = server.clone();
+						let protocol_bytes_factory = protocol_bytes_factory.clone();
 						self.accept.push(async move {
 							let (session, url, identity) = super::quinn::accept(_conn, alpns).await?;
+							let server = protocol_bytes_factory
+								.as_ref()
+								.and_then(|factory| factory(url.as_ref()))
+								.map_or_else(|| server.clone(), |bytes| server.clone().with_protocol_bytes(bytes));
 							let request = server.accept_request(session).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Quinn(Box::new(request)) })
 						}.boxed());
@@ -461,8 +495,14 @@ impl Server {
 					#[cfg(feature = "quiche")]
 					{
 						let alpns = versions.alpns();
+						let server = server.clone();
+						let protocol_bytes_factory = protocol_bytes_factory.clone();
 						self.accept.push(async move {
 							let (session, url, identity) = super::quiche::accept(_conn, alpns).await?;
+							let server = protocol_bytes_factory
+								.as_ref()
+								.and_then(|factory| factory(url.as_ref()))
+								.map_or_else(|| server.clone(), |bytes| server.clone().with_protocol_bytes(bytes));
 							let request = server.accept_request(session).await?;
 							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Quiche(Box::new(request)) })
 						}.boxed());
@@ -470,11 +510,19 @@ impl Server {
 				}
 				Some(_conn) = iroh_accept => {
 					#[cfg(feature = "iroh")]
-					self.accept.push(async move {
+					{
+						let server = server.clone();
+						let protocol_bytes_factory = protocol_bytes_factory.clone();
+						self.accept.push(async move {
 						let (session, url, identity) = super::iroh::accept(_conn).await?;
+						let server = protocol_bytes_factory
+							.as_ref()
+							.and_then(|factory| factory(url.as_ref()))
+							.map_or_else(|| server.clone(), |bytes| server.clone().with_protocol_bytes(bytes));
 						let request = server.accept_request(session).await?;
 						Ok(Request { transport: Transport::Iroh, url, identity, kind: RequestKind::Iroh(Box::new(request)) })
-					}.boxed());
+						}.boxed());
+					}
 				}
 				Some(_res) = ws_accept => {
 					#[cfg(feature = "websocket")]
@@ -482,7 +530,13 @@ impl Server {
 						Ok(session) => {
 							// Read the SETUP off the qmux session before handing it over, so a
 							// slow peer doesn't stall the accept loop (spawned like the others).
+							let server = server.clone();
+							let protocol_bytes_factory = protocol_bytes_factory.clone();
 							self.accept.push(async move {
+								let server = protocol_bytes_factory
+									.as_ref()
+									.and_then(|factory| factory(None))
+									.map_or_else(|| server.clone(), |bytes| server.clone().with_protocol_bytes(bytes));
 								let request = server.accept_request(session).await?;
 								Ok(Request { transport: Transport::WebSocket, url: None, identity: None, kind: RequestKind::Qmux(Box::new(request)) })
 							}.boxed());
@@ -613,6 +667,7 @@ enum StreamBind {
 struct StreamListeners {
 	binds: Vec<StreamBind>,
 	versions: moq_net::Versions,
+	protocol_bytes_factory: Option<ProtocolBytesFactory>,
 	#[cfg(all(feature = "uds", unix))]
 	unix_allow: Option<crate::unix::Allow>,
 	rx: Option<tokio::sync::mpsc::Receiver<Request>>,
@@ -629,11 +684,16 @@ impl StreamListeners {
 		Self {
 			binds,
 			versions,
+			protocol_bytes_factory: None,
 			#[cfg(all(feature = "uds", unix))]
 			unix_allow,
 			rx: None,
 			tasks: Vec::new(),
 		}
+	}
+
+	fn with_protocol_bytes_factory(&mut self, factory: Option<ProtocolBytesFactory>) {
+		self.protocol_bytes_factory = factory;
 	}
 
 	/// Bind the configured listeners and spawn their accept loops, once.
@@ -645,6 +705,7 @@ impl StreamListeners {
 		let (tx, rx) = tokio::sync::mpsc::channel(16);
 		for bind in self.binds.drain(..) {
 			let versions = self.versions.clone();
+			let protocol_bytes_factory = self.protocol_bytes_factory.clone();
 			match bind {
 				#[cfg(feature = "tcp")]
 				StreamBind::Tcp(addr) => {
@@ -653,7 +714,8 @@ impl StreamListeners {
 					}
 					let listener = crate::tcp::Listener::bind(addr).await?.with_protocols(versions.alpns());
 					tracing::info!(%addr, "listening (tcp)");
-					self.tasks.push(spawn_tcp_loop(listener, versions, tx.clone()));
+					self.tasks
+						.push(spawn_tcp_loop(listener, versions, protocol_bytes_factory, tx.clone()));
 				}
 				#[cfg(all(feature = "uds", unix))]
 				StreamBind::Unix(path) => {
@@ -664,8 +726,13 @@ impl StreamListeners {
 					// and the worker usually runs as a different user than the server.
 					listener.set_mode(0o666)?;
 					tracing::info!(path = %path.display(), allow = ?self.unix_allow, "listening (unix)");
-					self.tasks
-						.push(spawn_unix_loop(listener, versions, self.unix_allow.clone(), tx.clone()));
+					self.tasks.push(spawn_unix_loop(
+						listener,
+						versions,
+						protocol_bytes_factory,
+						self.unix_allow.clone(),
+						tx.clone(),
+					));
 				}
 			}
 		}
@@ -697,12 +764,19 @@ impl Drop for StreamListeners {
 fn spawn_tcp_loop(
 	listener: crate::tcp::Listener,
 	versions: moq_net::Versions,
+	protocol_bytes_factory: Option<ProtocolBytesFactory>,
 	tx: tokio::sync::mpsc::Sender<Request>,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		loop {
 			match listener.accept().await {
-				Some(Ok(session)) => spawn_stream_request(session, Transport::Tcp, versions.clone(), tx.clone()),
+				Some(Ok(session)) => spawn_stream_request(
+					session,
+					Transport::Tcp,
+					versions.clone(),
+					protocol_bytes_factory.clone(),
+					tx.clone(),
+				),
 				Some(Err(err)) => tracing::warn!(%err, "tcp listener accept failed"),
 				None => break,
 			}
@@ -714,6 +788,7 @@ fn spawn_tcp_loop(
 fn spawn_unix_loop(
 	listener: crate::unix::Listener,
 	versions: moq_net::Versions,
+	protocol_bytes_factory: Option<ProtocolBytesFactory>,
 	allow: Option<crate::unix::Allow>,
 	tx: tokio::sync::mpsc::Sender<Request>,
 ) -> tokio::task::JoinHandle<()> {
@@ -728,7 +803,13 @@ fn spawn_unix_loop(
 						tracing::warn!(uid = cred.uid, gid = cred.gid, pid = ?cred.pid, "unix connection rejected by allow list");
 						continue;
 					}
-					spawn_stream_request(session, Transport::Unix, versions.clone(), tx.clone());
+					spawn_stream_request(
+						session,
+						Transport::Unix,
+						versions.clone(),
+						protocol_bytes_factory.clone(),
+						tx.clone(),
+					);
 				}
 				Some(Err(err)) => tracing::warn!(%err, "unix listener accept failed"),
 				None => break,
@@ -744,10 +825,15 @@ fn spawn_stream_request(
 	session: qmux::Session,
 	transport: Transport,
 	versions: moq_net::Versions,
+	protocol_bytes_factory: Option<ProtocolBytesFactory>,
 	tx: tokio::sync::mpsc::Sender<Request>,
 ) {
 	tokio::spawn(async move {
 		let server = moq_net::Server::new().with_versions(versions);
+		let server = protocol_bytes_factory
+			.as_ref()
+			.and_then(|factory| factory(None))
+			.map_or(server.clone(), |bytes| server.with_protocol_bytes(bytes));
 		match server.accept_request(session).await {
 			Ok(request) => {
 				let request = Request {
@@ -771,15 +857,15 @@ fn spawn_stream_request(
 /// underlying session type; all of them delegate identically.
 pub(crate) enum RequestKind {
 	#[cfg(feature = "noq")]
-	Noq(Box<moq_net::Request<web_transport_noq::Session>>),
+	Noq(Box<moq_net::Request<moq_net::MeteredSession<web_transport_noq::Session>>>),
 	#[cfg(feature = "quinn")]
-	Quinn(Box<moq_net::Request<web_transport_quinn::Session>>),
+	Quinn(Box<moq_net::Request<moq_net::MeteredSession<web_transport_quinn::Session>>>),
 	#[cfg(feature = "quiche")]
-	Quiche(Box<moq_net::Request<web_transport_quiche::Connection>>),
+	Quiche(Box<moq_net::Request<moq_net::MeteredSession<web_transport_quiche::Connection>>>),
 	#[cfg(feature = "iroh")]
-	Iroh(Box<moq_net::Request<web_transport_iroh::Session>>),
+	Iroh(Box<moq_net::Request<moq_net::MeteredSession<web_transport_iroh::Session>>>),
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix), feature = "websocket"))]
-	Qmux(Box<moq_net::Request<qmux::Session>>),
+	Qmux(Box<moq_net::Request<moq_net::MeteredSession<qmux::Session>>>),
 }
 
 /// The network transport carrying an incoming MoQ session.
@@ -952,6 +1038,19 @@ impl Request {
 			identity,
 			kind,
 		}
+	}
+
+	/// Returns whether either model data direction is wired on the request.
+	///
+	/// This reports the server-side builder state immediately before [`ok`](Self::ok),
+	/// not whether application data has already crossed the session.
+	pub fn has_data_path(&self) -> bool {
+		request_ref!(self, request => request.has_data_path())
+	}
+
+	/// Returns the protocol byte counter attached before SETUP parsing.
+	pub fn protocol_bytes(&self) -> Option<moq_net::ProtocolBytes> {
+		request_ref!(self, request => request.protocol_bytes())
 	}
 
 	/// Accept the session, starting the MoQ session loops.

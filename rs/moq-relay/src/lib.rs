@@ -12,6 +12,7 @@ mod cache;
 mod cluster;
 mod config;
 mod connection;
+mod control_telemetry;
 mod http_client;
 mod internal;
 mod nodes;

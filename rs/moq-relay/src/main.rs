@@ -38,6 +38,22 @@ async fn main() -> anyhow::Result<()> {
 		None => (server, client),
 	};
 
+	// Create the protocol-byte meter before native Server parses SETUP, so inbound
+	// control-only evidence includes the peer's initial handshake bytes. URL-less
+	// transports need an explicit opt-in because the factory cannot inspect their
+	// SETUP path until after the meter must already be attached.
+	let protocol_bytes_url_less = config.protocol_bytes_url_less.unwrap_or(false);
+	let server = server.with_protocol_bytes_factory(move |url| {
+		if url.is_none() {
+			return protocol_bytes_url_less.then(moq_net::ProtocolBytes::enabled);
+		}
+		url.filter(|url| {
+			url.query_pairs()
+				.any(|(key, value)| key == "control_only" && value == "true")
+		})
+		.map(|_| moq_net::ProtocolBytes::enabled())
+	});
+
 	// Reject configs where neither JWT nor mTLS can authenticate anyone.
 	if config.auth.is_empty() {
 		anyhow::ensure!(

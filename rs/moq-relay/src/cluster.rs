@@ -16,7 +16,7 @@ use tokio::task::AbortHandle;
 use tracing::Instrument as _;
 use url::Url;
 
-use crate::{AuthToken, nodes::MESH_PREFIX};
+use crate::{AuthToken, control_telemetry, nodes::MESH_PREFIX};
 
 /// How often the discovery loop scans for stale entries.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -416,6 +416,10 @@ pub struct Cluster {
 	/// returns) so traffic classes land in separate counter sets. Defaults
 	/// to a disabled (no-op) registry until [`with_stats`](Self::with_stats) is called.
 	pub stats: moq_net::stats::Registry,
+
+	/// Connection-scoped telemetry for observation-only inbound and outbound cluster
+	/// sessions. Legacy and normal namespace-filtered sessions do not enter this registry.
+	pub(crate) control_sessions: control_telemetry::Registry,
 }
 
 impl Cluster {
@@ -449,6 +453,7 @@ impl Cluster {
 			info,
 			origin,
 			stats: moq_net::stats::Registry::disabled(),
+			control_sessions: control_telemetry::Registry::default(),
 		})
 	}
 
@@ -512,15 +517,15 @@ impl Cluster {
 
 	/// Billing tier cluster-peer traffic records under (`--cluster-tier`).
 	/// An absent or empty label selects the default unprefixed tier.
-	fn cluster_tier(&self) -> Tier {
+	pub(crate) fn cluster_tier(&self) -> Tier {
 		crate::configured_tier(self.config.tier.clone())
 	}
 
-	fn namespace_filter_enabled(&self) -> bool {
+	pub(crate) fn namespace_filter_enabled(&self) -> bool {
 		self.config.namespace_filter.unwrap_or(false)
 	}
 
-	fn validate_namespace(value: &str, label: &str) -> anyhow::Result<()> {
+	pub(crate) fn validate_namespace(value: &str, label: &str) -> anyhow::Result<()> {
 		anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
 		anyhow::ensure!(
 			!value.starts_with('/') && !value.ends_with('/'),
@@ -968,6 +973,10 @@ impl Cluster {
 
 	async fn run_remote_inner(self, remote: &str, token: String) -> anyhow::Result<()> {
 		let mut url = peer_url(remote)?;
+		// `control_only=true` is local static-connect policy. It is consumed for
+		// dialing configuration, then reattached as an explicit request marker so
+		// the inbound relay can enforce the same no-publisher/no-subscriber policy.
+		let control_only = take_control_only(&mut url)?;
 		// The link's price, declared by us as the dialing side and charged to
 		// every announcement crossing the connection (see
 		// `moq_net::Client::with_cost`). Carried as a `?cost=` query
@@ -975,9 +984,22 @@ impl Cluster {
 		// each price their links: 0 for a same-datacenter sibling, higher for a
 		// metered backbone. Stripped here; the value rides SETUP, not the URL.
 		let cost = take_cost(&mut url)?;
-		// Namespace is a local-only routing hint. It selects the remote origin
-		// scope for this session and is never sent as an application URL query.
+		// Namespace selects the remote origin scope for normal data sessions. For
+		// control-only observation dials, preserve both markers on the transport URL
+		// so the inbound relay can classify and enforce the same policy.
 		let remote_namespace = take_namespace(&mut url)?;
+		if control_only {
+			anyhow::ensure!(
+				self.namespace_filter_enabled(),
+				"control-only cluster peers require namespace filtering"
+			);
+			url.query_pairs_mut()
+				.append_pair(control_telemetry::CONTROL_ONLY_QUERY, "true");
+			if let Some(remote_namespace) = remote_namespace.as_deref() {
+				url.query_pairs_mut()
+					.append_pair(control_telemetry::NAMESPACE_QUERY, remote_namespace);
+			}
+		}
 		if self.namespace_filter_enabled() {
 			let remote_namespace = remote_namespace
 				.as_deref()
@@ -1004,7 +1026,9 @@ impl Cluster {
 
 		loop {
 			let started = tokio::time::Instant::now();
-			let result = self.run_remote_once(&url, cost, remote_namespace.as_deref()).await;
+			let result = self
+				.run_remote_once(&url, cost, remote_namespace.as_deref(), control_only)
+				.await;
 			let elapsed = started.elapsed();
 
 			match result {
@@ -1028,11 +1052,12 @@ impl Cluster {
 		url: &Url,
 		cost: Option<u64>,
 		remote_namespace: Option<&str>,
+		control_only: bool,
 	) -> anyhow::Result<()> {
 		// Each attempt is its own session, so it gets its own id. Matches the span an
 		// accepted connection runs under, so both directions log the same way.
 		let id = self.next_connection_id();
-		self.run_remote_session(id, url, cost, remote_namespace)
+		self.run_remote_session(id, url, cost, remote_namespace, control_only)
 			.instrument(tracing::info_span!("conn", id))
 			.await
 	}
@@ -1043,6 +1068,7 @@ impl Cluster {
 		url: &Url,
 		cost: Option<u64>,
 		remote_namespace: Option<&str>,
+		control_only: bool,
 	) -> anyhow::Result<()> {
 		let mut log_url = url.clone();
 		log_url.set_query(None);
@@ -1054,40 +1080,79 @@ impl Cluster {
 			.clone()
 			.context("internal: cluster peer dial without an attached QUIC client")?;
 
-		// Cluster dials use their configured stats tier. Cluster peers carry no auth
-		// root, so presence is keyed under the empty root within the cluster tier.
-		let mut client = client.with_stats(self.stats.tier(self.cluster_tier()).session(""));
-		if self.namespace_filter_enabled() {
-			let local_namespace = self
-				.config
-				.namespace
-				.as_deref()
-				.expect("namespace filtering was validated before cluster tasks started");
-			let remote_namespace =
-				remote_namespace.expect("namespace filtering requires a remote namespace on every peer URL");
-			let publisher = self
-				.origin
-				.scope(&[Path::new(local_namespace)])
-				.context("failed to scope cluster publisher namespace")?;
-			let subscriber = self
-				.origin
-				.scope(&[Path::new(remote_namespace)])
-				.context("failed to scope cluster subscriber namespace")?;
-			tracing::info!(%local_namespace, %remote_namespace, "namespace-filtered cluster session");
-			client = client.with_publisher(publisher).with_subscriber(subscriber);
+		// Normal cluster dials use the relay-wide stats registry. Observation-only
+		// dials get a private model registry so their data counters cannot be
+		// contaminated by adjacent application sessions.
+		let mut telemetry = None;
+		let mut client = if control_only {
+			let model_registry = moq_net::stats::Registry::new(Default::default());
+			let model_session = model_registry.tier(self.cluster_tier()).session("");
+			telemetry = Some(self.control_sessions.begin(
+				id,
+				control_telemetry::Direction::Outbound,
+				log_url.to_string(),
+				remote_namespace.map(str::to_owned),
+				model_registry,
+			));
+			tracing::info!(
+				control_only,
+				remote_namespace = ?remote_namespace,
+				"control-only cluster session configured"
+			);
+			client
+				.with_stats(model_session)
+				.with_protocol_bytes(moq_net::ProtocolBytes::enabled())
 		} else {
-			client = client.with_publisher(&self.origin).with_subscriber(self.origin.clone());
+			client.with_stats(self.stats.tier(self.cluster_tier()).session(""))
+		};
+		if !control_only {
+			if self.namespace_filter_enabled() {
+				let local_namespace = self
+					.config
+					.namespace
+					.as_deref()
+					.expect("namespace filtering was validated before cluster tasks started");
+				let remote_namespace =
+					remote_namespace.expect("namespace filtering requires a remote namespace on every peer URL");
+				let publisher = self
+					.origin
+					.scope(&[Path::new(local_namespace)])
+					.context("failed to scope cluster publisher namespace")?;
+				let subscriber = self
+					.origin
+					.scope(&[Path::new(remote_namespace)])
+					.context("failed to scope cluster subscriber namespace")?;
+				tracing::info!(%local_namespace, %remote_namespace, control_only, "namespace-filtered cluster session");
+				client = client.with_publisher(publisher).with_subscriber(subscriber);
+			} else {
+				client = client.with_publisher(&self.origin).with_subscriber(self.origin.clone());
+			}
 		}
 		if let Some(cost) = cost {
 			client = client.with_cost(cost);
 		}
-		let cs = client
-			.connect(url.clone())
-			.await
-			.context("failed to connect to cluster peer")?;
+		if let Some(telemetry) = &telemetry {
+			telemetry.set_data_path_attached(client.has_data_path());
+		}
+		let cs = match client.connect(url.clone()).await {
+			Ok(session) => session,
+			Err(error) => {
+				if let Some(mut telemetry) = telemetry {
+					telemetry.finish(control_telemetry::State::Failed, Some(error.to_string()));
+				}
+				return Err(error).context("failed to connect to cluster peer");
+			}
+		};
+		if let Some(telemetry) = &telemetry {
+			telemetry.connected(&cs);
+		}
 		let _connection = self.nodes.connect_outbound(id, log_url.to_string());
 
-		Err(cs.closed().await.into())
+		let close_error = cs.closed().await;
+		if let Some(mut telemetry) = telemetry {
+			telemetry.finish(control_telemetry::State::Closed, Some(close_error.to_string()));
+		}
+		Err(close_error.into())
 	}
 }
 
@@ -1124,11 +1189,42 @@ fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
 	Ok(Some(cost))
 }
 
+/// Extract and remove the local-only `control_only` query param from a peer URL.
+///
+/// The parsed marker is reattached by `run_remote_inner` as a wire-visible,
+/// stricter request policy so the inbound relay can classify and enforce it.
+fn take_control_only(url: &mut Url) -> anyhow::Result<bool> {
+	let Some(value) = url
+		.query_pairs()
+		.find_map(|(key, value)| (key == "control_only").then(|| value.into_owned()))
+	else {
+		return Ok(false);
+	};
+
+	let control_only = match value.as_str() {
+		"true" => true,
+		"false" => false,
+		_ => anyhow::bail!("invalid control_only value {value:?}; expected true or false"),
+	};
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "control_only")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (key, value) in &remaining {
+			pairs.append_pair(key, value);
+		}
+	}
+	Ok(control_only)
+}
+
 /// Extract and remove the local-only `namespace` query param from a peer URL.
 ///
-/// Unlike `jwt`, this parameter is not an authentication input and must never
-/// reach the remote HTTP endpoint. Its value selects the remote relay origin
-/// scope for a namespace-filtered cluster session.
+/// Its value selects the remote relay origin scope for a namespace-filtered
+/// cluster session. Observation-only dials reattach it as a telemetry marker.
 fn take_namespace(url: &mut Url) -> anyhow::Result<Option<String>> {
 	let Some(value) = url
 		.query_pairs()
@@ -1271,6 +1367,20 @@ mod tests {
 	}
 
 	#[test]
+	fn control_only_param_is_consumed() {
+		let mut url = Url::parse("https://peer.example/?namespace=remote&control_only=true").unwrap();
+		assert!(take_control_only(&mut url).unwrap());
+		assert_eq!(url.as_str(), "https://peer.example/?namespace=remote");
+
+		let mut url = Url::parse("https://peer.example/?control_only=false").unwrap();
+		assert!(!take_control_only(&mut url).unwrap());
+		assert_eq!(url.as_str(), "https://peer.example/");
+
+		let mut url = Url::parse("https://peer.example/?control_only=maybe").unwrap();
+		assert!(take_control_only(&mut url).is_err());
+	}
+
+	#[test]
 	fn namespace_param_is_consumed() {
 		let mut url = Url::parse("https://peer.example/?jwt=abc&namespace=room%2Frun%2Farea%2Fwest").unwrap();
 		assert_eq!(take_namespace(&mut url).unwrap().as_deref(), Some("room/run/area/west"));
@@ -1283,39 +1393,62 @@ mod tests {
 
 	#[test]
 	fn namespace_filter_rejects_invalid_local_namespace() {
-		let mut config = ClusterConfig::default();
-		config.namespace_filter = Some(true);
-		config.namespace = Some("/absolute".to_string());
-		config.connect = vec!["https://peer.example/?namespace=remote".to_string()];
+		let config = ClusterConfig {
+			namespace_filter: Some(true),
+			namespace: Some("/absolute".to_string()),
+			connect: vec!["https://peer.example/?namespace=remote".to_string()],
+			..Default::default()
+		};
 		let cluster = Cluster::new(config).unwrap();
 		assert!(cluster.namespace_filter_config(false).is_err());
 	}
 
 	#[test]
 	fn namespace_filter_requires_remote_namespace() {
-		let mut config = ClusterConfig::default();
-		config.namespace_filter = Some(true);
-		config.namespace = Some("local".to_string());
-		config.connect = vec!["https://peer.example/".to_string()];
+		let config = ClusterConfig {
+			namespace_filter: Some(true),
+			namespace: Some("local".to_string()),
+			connect: vec!["https://peer.example/".to_string()],
+			..Default::default()
+		};
 		let cluster = Cluster::new(config).unwrap();
 		assert!(cluster.namespace_filter_config(false).is_err());
 	}
 
 	#[test]
 	fn namespace_filter_accepts_passive_leaf_without_outbound_peers() {
-		let mut config = ClusterConfig::default();
-		config.namespace_filter = Some(true);
-		config.namespace = Some("room/run/area/south-east".to_string());
+		let config = ClusterConfig {
+			namespace_filter: Some(true),
+			namespace: Some("room/run/area/south-east".to_string()),
+			..Default::default()
+		};
 		let cluster = Cluster::new(config).unwrap();
 		cluster.namespace_filter_config(false).unwrap();
 	}
 
 	#[test]
 	fn namespace_filter_accepts_static_peer_scopes() {
-		let mut config = ClusterConfig::default();
-		config.namespace_filter = Some(true);
-		config.namespace = Some("room/run/area/west".to_string());
-		config.connect = vec!["https://peer.example/?namespace=room%2Frun%2Farea%2Feast".to_string()];
+		let config = ClusterConfig {
+			namespace_filter: Some(true),
+			namespace: Some("room/run/area/west".to_string()),
+			connect: vec!["https://peer.example/?namespace=room%2Frun%2Farea%2Feast".to_string()],
+			..Default::default()
+		};
+		let cluster = Cluster::new(config).unwrap();
+		cluster.namespace_filter_config(false).unwrap();
+	}
+
+	#[test]
+	fn namespace_filter_accepts_control_only_peer_scope() {
+		let config = ClusterConfig {
+			namespace_filter: Some(true),
+			namespace: Some("room/run/area/west".to_string()),
+			connect: vec![
+				"https://peer.example/?namespace=room%2Frun%2Fobservation%2Fdiagonal%2Fleaf1-leaf4&control_only=true"
+					.to_string(),
+			],
+			..Default::default()
+		};
 		let cluster = Cluster::new(config).unwrap();
 		cluster.namespace_filter_config(false).unwrap();
 	}

@@ -7,7 +7,11 @@
 //! "axum-only-advertises-bare-`webtransport`" bug that silently downgraded
 //! relay clients to moq-lite-02.
 
-use std::{net::TcpListener, time::Duration};
+use std::{
+	net::TcpListener,
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use moq_native::moq_net::{self, Origin};
 use moq_relay::{AuthConfig, Cluster, ClusterConfig, Connection, PublicConfig, Web, WebConfig};
@@ -244,6 +248,24 @@ async fn relay_web_serves_merged_routes() {
 /// `/{*path}`-only route, which left bare-URL clients (e.g.
 /// `moqsink url="https://host:4443"`) with a silently dead WS fallback.
 #[tokio::test]
+async fn relay_websocket_rejects_reserved_cluster_markers() {
+	let (port, web_handle) = spawn_relay().await;
+	let response = reqwest::Client::new()
+		.get(format!(
+			"http://127.0.0.1:{port}/anon?control_only=true&namespace=observation%2Fdiagonal"
+		))
+		.header("Connection", "Upgrade")
+		.header("Upgrade", "websocket")
+		.header("Sec-WebSocket-Version", "13")
+		.header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+		.send()
+		.await
+		.expect("reserved-marker WebSocket request failed");
+	assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+	web_handle.abort();
+}
+
+#[tokio::test]
 async fn relay_websocket_root_path_upgrades() {
 	let (port, web_handle) = spawn_relay().await;
 	// No path: the URL is just host:port, so the WS handshake targets "/".
@@ -392,9 +414,38 @@ async fn spawn_accept_relay(
 	config: moq_native::ServerConfig,
 	auth_config: AuthConfig,
 ) -> (Option<std::net::SocketAddr>, tokio::task::JoinHandle<()>) {
+	let (addr, handle, _) = spawn_accept_relay_with_options(config, auth_config, ClusterConfig::default(), false).await;
+	(addr, handle)
+}
+
+async fn spawn_accept_relay_with_options(
+	config: moq_native::ServerConfig,
+	auth_config: AuthConfig,
+	cluster_config: ClusterConfig,
+	enable_url_less_protocol_bytes: bool,
+) -> (
+	Option<std::net::SocketAddr>,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 	let mut server = config.init().expect("server init");
+	let protocol_bytes = Arc::new(Mutex::new(Vec::new()));
+	if enable_url_less_protocol_bytes {
+		let protocol_bytes_capture = protocol_bytes.clone();
+		server = server.with_protocol_bytes_factory(move |url| {
+			if url.is_some() {
+				return None;
+			}
+			let bytes = moq_net::ProtocolBytes::enabled();
+			protocol_bytes_capture
+				.lock()
+				.expect("protocol bytes mutex")
+				.push(bytes.clone());
+			Some(bytes)
+		});
+	}
 	let addr = server.local_addr().ok();
 
 	let auth = auth_config
@@ -402,7 +453,7 @@ async fn spawn_accept_relay(
 		.await
 		.expect("auth init");
 
-	let cluster = Cluster::new(ClusterConfig::default()).expect("cluster init");
+	let cluster = Cluster::new(cluster_config).expect("cluster init");
 
 	let handle = tokio::spawn(async move {
 		let mut id = 0;
@@ -420,7 +471,7 @@ async fn spawn_accept_relay(
 		}
 	});
 
-	(addr, handle)
+	(addr, handle, protocol_bytes)
 }
 
 /// Stand up the relay listening only on a plain-TCP qmux `--server-bind` on a
@@ -458,14 +509,49 @@ async fn spawn_internal_relay() -> (u16, tokio::task::JoinHandle<()>) {
 	(port, handle)
 }
 
+async fn spawn_control_only_tcp_relay(
+	enable_url_less_protocol_bytes: bool,
+) -> (
+	u16,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
+	let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+	let port = probe.local_addr().expect("local addr").port();
+	drop(probe);
+
+	let mut config = moq_native::ServerConfig::default();
+	config.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse addr"));
+	#[allow(deprecated)]
+	let public = PublicConfig::Simple(vec![String::new()]);
+	let mut auth_config = AuthConfig::default();
+	auth_config.public = Some(public);
+	let mut cluster_config = ClusterConfig::default();
+	cluster_config.namespace_filter = Some(true);
+	cluster_config.namespace = Some("room/run/area/west".to_string());
+	let (addr, handle, protocol_bytes) =
+		spawn_accept_relay_with_options(config, auth_config, cluster_config, enable_url_less_protocol_bytes).await;
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	loop {
+		if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+			break;
+		}
+		if std::time::Instant::now() >= deadline {
+			panic!("control-only TCP listener never became ready on {addr:?}:{port}");
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+	(port, handle, protocol_bytes)
+}
+
 /// Connect a publisher and subscriber to a stream `--server-bind` over `tcp://`
 /// (plain TCP, no TLS, no JWT) and confirm a frame round-trips. Exercises the
 /// qmux-over-TCP transport and no-JWT resolution through public auth.
 #[tokio::test]
 async fn internal_tcp_round_trip() {
 	let (port, handle) = spawn_internal_relay().await;
-	// The raw-TCP transport dials host:port only; any URL path is ignored.
-	let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	// The explicit root target is carried in the SETUP; a pathless URL is rejected.
+	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 	let expected_version = newest_lite_version();
 
 	// ── publisher ───────────────────────────────────────────────────
@@ -569,6 +655,44 @@ async fn spawn_internal_unix_relay() -> (std::path::PathBuf, tokio::task::JoinHa
 	(path, handle)
 }
 
+#[cfg(unix)]
+async fn spawn_control_only_unix_relay(
+	enable_url_less_protocol_bytes: bool,
+) -> (
+	std::path::PathBuf,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
+	static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let path = std::path::PathBuf::from(format!("/tmp/moq-control-only-{}-{seq}.sock", std::process::id()));
+	let mut config = moq_native::ServerConfig::default();
+	config.unix.bind = Some(path.clone());
+	#[allow(deprecated)]
+	let public = PublicConfig::Simple(vec![String::new()]);
+	let mut auth_config = AuthConfig::default();
+	auth_config.public = Some(public);
+	let mut cluster_config = ClusterConfig::default();
+	cluster_config.namespace_filter = Some(true);
+	cluster_config.namespace = Some("room/run/area/west".to_string());
+	let (addr, handle, protocol_bytes) =
+		spawn_accept_relay_with_options(config, auth_config, cluster_config, enable_url_less_protocol_bytes).await;
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	loop {
+		if tokio::net::UnixStream::connect(&path).await.is_ok() {
+			break;
+		}
+		if std::time::Instant::now() >= deadline {
+			panic!(
+				"control-only Unix listener never became ready at {addr:?}:{}",
+				path.display()
+			);
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+	(path, handle, protocol_bytes)
+}
+
 /// Connect over `unix://` (qmux on a Unix socket) and confirm a frame
 /// round-trips. Also asserts both sides land on the newest moq-lite version,
 /// which proves the in-band ALPN negotiation populated the protocol.
@@ -577,7 +701,7 @@ async fn spawn_internal_unix_relay() -> (std::path::PathBuf, tokio::task::JoinHa
 async fn internal_unix_round_trip() {
 	let (path, handle) = spawn_internal_unix_relay().await;
 	// `unix://` + an absolute path yields the triple-slash form the client expects.
-	let url: url::Url = format!("unix://{}", path.display()).parse().expect("parse url");
+	let url: url::Url = format!("unix://{}?path=/", path.display()).parse().expect("parse url");
 	let expected_version = newest_lite_version();
 
 	// ── publisher ───────────────────────────────────────────────────
@@ -715,7 +839,7 @@ async fn internal_tcp_path_reaches_server() {
 
 	// Publisher addresses `/room`; subscriber addresses the bare root.
 	let pub_url: url::Url = format!("tcp://127.0.0.1:{port}/room").parse().expect("parse url");
-	let sub_url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let sub_url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 
 	for version in path_versions() {
 		let announced = path_round_trip(version, pub_url.clone(), sub_url.clone(), "test").await;
@@ -739,7 +863,7 @@ async fn internal_unix_path_reaches_server() {
 	let pub_url: url::Url = format!("unix://{}?path=room", path.display())
 		.parse()
 		.expect("parse url");
-	let sub_url: url::Url = format!("unix://{}", path.display()).parse().expect("parse url");
+	let sub_url: url::Url = format!("unix://{}?path=/", path.display()).parse().expect("parse url");
 
 	for version in path_versions() {
 		let announced = path_round_trip(version, pub_url.clone(), sub_url.clone(), "test").await;
@@ -769,6 +893,30 @@ async fn spawn_quic_relay() -> (std::net::SocketAddr, tokio::task::JoinHandle<()
 	(addr.expect("relay bound no QUIC socket"), handle)
 }
 
+async fn spawn_control_only_quic_relay(
+	enable_url_less_protocol_bytes: bool,
+) -> (
+	std::net::SocketAddr,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
+	let mut config = moq_native::ServerConfig::default();
+	config.bind = Some("127.0.0.1:0".to_string());
+	config.tls.generate = vec!["localhost".into()];
+
+	#[allow(deprecated)]
+	let public = PublicConfig::Simple(vec![String::new()]);
+	let mut auth_config = AuthConfig::default();
+	auth_config.public = Some(public);
+
+	let mut cluster_config = ClusterConfig::default();
+	cluster_config.namespace_filter = Some(true);
+	cluster_config.namespace = Some("room/run/area/west".to_string());
+	let (addr, handle, protocol_bytes) =
+		spawn_accept_relay_with_options(config, auth_config, cluster_config, enable_url_less_protocol_bytes).await;
+	(addr.expect("relay bound no QUIC socket"), handle, protocol_bytes)
+}
+
 /// Raw QUIC has no request URI either, so `moqt://host:port/<path>` only reaches the
 /// relay if the client puts it in the SETUP. Same assertion as TCP: the relay scopes
 /// the publisher's grant to that root, across every version whose SETUP carries a path.
@@ -779,7 +927,7 @@ async fn raw_quic_path_reaches_server() {
 	// Dialing an IP literal sends no SNI, so the SETUP is the only thing the server
 	// has to go on.
 	let pub_url: url::Url = format!("moqt://{addr}/room").parse().expect("parse url");
-	let sub_url: url::Url = format!("moqt://{addr}").parse().expect("parse url");
+	let sub_url: url::Url = format!("moqt://{addr}/").parse().expect("parse url");
 
 	for version in path_versions() {
 		let announced = path_round_trip(version, pub_url.clone(), sub_url.clone(), "test").await;
@@ -789,6 +937,267 @@ async fn raw_quic_path_reaches_server() {
 		);
 	}
 
+	handle.abort();
+}
+
+/// A URL-less request without an explicit SETUP path must not fall back to root
+/// auth, including the legacy Lite01-04 versions that cannot carry a path at all.
+#[tokio::test]
+async fn url_less_pathless_request_is_rejected() {
+	let (addr, handle) = spawn_quic_relay().await;
+	for version_name in [
+		"moq-lite-01",
+		"moq-lite-02",
+		"moq-lite-03",
+		"moq-lite-04",
+		"moq-transport-14",
+		"moq-transport-19",
+	] {
+		let version: moq_net::Version = version_name.parse().expect("parse version");
+		let url: url::Url = format!("moqt://{addr}").parse().expect("parse URL");
+		if let Ok(session) = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url))
+			.await
+			.expect("pathless raw QUIC connect timeout")
+		{
+			tokio::time::timeout(TIMEOUT, session.closed())
+				.await
+				.expect("pathless raw QUIC session was not rejected");
+		}
+	}
+
+	handle.abort();
+}
+
+/// Plain TCP qmux must reject the same pathless legacy and modern requests instead
+/// of authorizing the public root implicitly.
+#[tokio::test]
+async fn tcp_qmux_pathless_request_is_rejected() {
+	let (port, handle) = spawn_internal_relay().await;
+	for version_name in ["moq-lite-01", "moq-lite-04", "moq-transport-19"] {
+		let version: moq_net::Version = version_name.parse().expect("parse version");
+		let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse URL");
+		if let Ok(session) = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url))
+			.await
+			.expect("pathless TCP qmux connect timeout")
+		{
+			tokio::time::timeout(TIMEOUT, session.closed())
+				.await
+				.expect("pathless TCP qmux session was not rejected");
+		}
+	}
+
+	handle.abort();
+}
+
+#[cfg(unix)]
+/// Unix qmux must reject a missing `?path=` target for the same reason as TCP qmux.
+#[tokio::test]
+async fn unix_qmux_pathless_request_is_rejected() {
+	let (path, handle) = spawn_internal_unix_relay().await;
+	for version_name in ["moq-lite-01", "moq-lite-04", "moq-transport-19"] {
+		let version: moq_net::Version = version_name.parse().expect("parse version");
+		let url: url::Url = format!("unix://{}", path.display()).parse().expect("parse URL");
+		if let Ok(session) = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url))
+			.await
+			.expect("pathless Unix qmux connect timeout")
+		{
+			tokio::time::timeout(TIMEOUT, session.closed())
+				.await
+				.expect("pathless Unix qmux session was not rejected");
+		}
+	}
+
+	handle.abort();
+}
+
+/// A raw QUIC SETUP carries the control-only markers that URL-bearing transports
+/// normally keep in their request URL. The relay must reject the marker when no
+/// URL-less meter is installed, and must classify the SETUP as control bytes when
+/// the explicit opt-in factory is present.
+#[tokio::test]
+async fn raw_quic_control_only_path_requires_and_records_protocol_bytes() {
+	let version: moq_net::Version = "moq-transport-19".parse().expect("parse Draft19");
+	let url = |addr: std::net::SocketAddr| -> url::Url {
+		format!("moqt://{addr}/anon?control_only=true&namespace=room%2Frun%2Farea%2Feast")
+			.parse()
+			.expect("parse raw control-only URL")
+	};
+
+	let (addr, handle, protocol_bytes) = spawn_control_only_quic_relay(true).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(addr)))
+		.await
+		.expect("raw control-only connect timeout")
+		.expect("raw control-only connect failed with meter enabled");
+	assert_eq!(session.version(), version);
+	let snapshot = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let snapshots: Vec<_> = protocol_bytes
+				.lock()
+				.expect("protocol bytes mutex")
+				.iter()
+				.map(moq_net::ProtocolBytes::snapshot)
+				.collect();
+			if let Some(snapshot) = snapshots
+				.iter()
+				.find(|snapshot| snapshot.control_bytes_sent > 0 && snapshot.control_bytes_received > 0)
+				.copied()
+			{
+				break snapshot;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("raw QUIC factory did not meter the SETUP");
+	assert_eq!(snapshot.data_bytes_sent, 0);
+	assert_eq!(snapshot.data_bytes_received, 0);
+	assert_eq!(snapshot.unclassified_bytes_sent, 0);
+	assert_eq!(snapshot.unclassified_bytes_received, 0);
+	drop(session);
+	handle.abort();
+
+	let (addr, handle, protocol_bytes) = spawn_control_only_quic_relay(false).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(addr)))
+		.await
+		.expect("raw control-only rejection handshake timeout")
+		.expect("raw control-only transport setup failed unexpectedly");
+	let closed = tokio::time::timeout(TIMEOUT, session.closed()).await;
+	assert!(
+		closed.is_ok(),
+		"raw control-only connection bypassed missing meter enforcement"
+	);
+	assert!(
+		protocol_bytes.lock().expect("protocol bytes mutex").is_empty(),
+		"meter unexpectedly installed without opt-in"
+	);
+	drop(session);
+	handle.abort();
+}
+
+/// Plain-TCP qmux has no request URI, so it must use the same SETUP marker and
+/// URL-less meter policy as raw QUIC. This keeps the two URL-less bindings from
+/// drifting apart.
+#[tokio::test]
+async fn tcp_qmux_control_only_path_requires_and_records_protocol_bytes() {
+	let version: moq_net::Version = "moq-transport-19".parse().expect("parse Draft19");
+	let url = |port: u16| -> url::Url {
+		format!("tcp://127.0.0.1:{port}/anon?control_only=true&namespace=room%2Frun%2Farea%2Feast")
+			.parse()
+			.expect("parse TCP control-only URL")
+	};
+
+	let (port, handle, protocol_bytes) = spawn_control_only_tcp_relay(true).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(port)))
+		.await
+		.expect("TCP control-only connect timeout")
+		.expect("TCP control-only connect failed with meter enabled");
+	assert_eq!(session.version(), version);
+	let snapshot = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let snapshots: Vec<_> = protocol_bytes
+				.lock()
+				.expect("protocol bytes mutex")
+				.iter()
+				.map(moq_net::ProtocolBytes::snapshot)
+				.collect();
+			if let Some(snapshot) = snapshots
+				.iter()
+				.find(|snapshot| snapshot.control_bytes_sent > 0 && snapshot.control_bytes_received > 0)
+				.copied()
+			{
+				break snapshot;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("TCP qmux factory did not meter the SETUP");
+	assert_eq!(snapshot.data_bytes_sent, 0);
+	assert_eq!(snapshot.data_bytes_received, 0);
+	assert_eq!(snapshot.unclassified_bytes_sent, 0);
+	assert_eq!(snapshot.unclassified_bytes_received, 0);
+	drop(session);
+	handle.abort();
+
+	let (port, handle, protocol_bytes) = spawn_control_only_tcp_relay(false).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(port)))
+		.await
+		.expect("TCP control-only rejection handshake timeout")
+		.expect("TCP control-only transport setup failed unexpectedly");
+	let closed = tokio::time::timeout(TIMEOUT, session.closed()).await;
+	assert!(
+		closed.is_ok(),
+		"TCP control-only connection bypassed missing meter enforcement"
+	);
+	assert!(
+		protocol_bytes.lock().expect("protocol bytes mutex").is_empty(),
+		"TCP meter unexpectedly installed without opt-in"
+	);
+	drop(session);
+	handle.abort();
+}
+
+#[cfg(unix)]
+/// Unix qmux is the second URL-less stream binding and must preserve the same
+/// control-only marker and opt-in metering contract as TCP qmux.
+#[tokio::test]
+async fn unix_qmux_control_only_path_requires_and_records_protocol_bytes() {
+	let version: moq_net::Version = "moq-transport-19".parse().expect("parse Draft19");
+	let url = |path: &std::path::Path| -> url::Url {
+		let mut url: url::Url = format!("unix://{}", path.display()).parse().expect("parse Unix URL");
+		url.query_pairs_mut()
+			.append_pair("path", "/anon?control_only=true&namespace=room%2Frun%2Farea%2Feast");
+		url
+	};
+
+	let (path, handle, protocol_bytes) = spawn_control_only_unix_relay(true).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(&path)))
+		.await
+		.expect("Unix control-only connect timeout")
+		.expect("Unix control-only connect failed with meter enabled");
+	assert_eq!(session.version(), version);
+	let snapshot = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let snapshots: Vec<_> = protocol_bytes
+				.lock()
+				.expect("protocol bytes mutex")
+				.iter()
+				.map(moq_net::ProtocolBytes::snapshot)
+				.collect();
+			if let Some(snapshot) = snapshots
+				.iter()
+				.find(|snapshot| snapshot.control_bytes_sent > 0 && snapshot.control_bytes_received > 0)
+				.copied()
+			{
+				break snapshot;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("Unix qmux factory did not meter the SETUP");
+	assert_eq!(snapshot.data_bytes_sent, 0);
+	assert_eq!(snapshot.data_bytes_received, 0);
+	assert_eq!(snapshot.unclassified_bytes_sent, 0);
+	assert_eq!(snapshot.unclassified_bytes_received, 0);
+	drop(session);
+	handle.abort();
+
+	let (path, handle, protocol_bytes) = spawn_control_only_unix_relay(false).await;
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url(&path)))
+		.await
+		.expect("Unix control-only rejection handshake timeout")
+		.expect("Unix control-only transport setup failed unexpectedly");
+	let closed = tokio::time::timeout(TIMEOUT, session.closed()).await;
+	assert!(
+		closed.is_ok(),
+		"Unix control-only connection bypassed missing meter enforcement"
+	);
+	assert!(
+		protocol_bytes.lock().expect("protocol bytes mutex").is_empty(),
+		"Unix meter unexpectedly installed without opt-in"
+	);
+	drop(session);
 	handle.abort();
 }
 
@@ -851,7 +1260,7 @@ async fn spawn_subscribe_only_relay() -> (u16, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn subscribe_only_public_rejects_publisher_role() {
 	let (port, handle) = spawn_subscribe_only_relay().await;
-	let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 
 	let pub_origin = Origin::random().produce();
 
@@ -878,7 +1287,7 @@ async fn subscribe_only_public_rejects_publisher_role() {
 #[tokio::test]
 async fn subscribe_only_public_accepts_subscriber_role() {
 	let (port, handle) = spawn_subscribe_only_relay().await;
-	let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 
 	let sub_origin = Origin::random().produce();
 	let session = tokio::time::timeout(TIMEOUT, client().with_subscriber(sub_origin).connect(url))
@@ -934,7 +1343,7 @@ async fn spawn_publish_only_relay() -> (u16, tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn publish_only_public_rejects_subscriber_role() {
 	let (port, handle) = spawn_publish_only_relay().await;
-	let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let url: url::Url = format!("tcp://127.0.0.1:{port}/").parse().expect("parse url");
 
 	let sub_origin = Origin::random().produce();
 

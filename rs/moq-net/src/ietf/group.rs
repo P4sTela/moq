@@ -189,6 +189,9 @@ impl GroupFlags {
 	pub const FIRST_OBJECT_BIT: u64 = 0x40;
 
 	pub fn encode(&self, version: Version) -> Result<u64, EncodeError> {
+		if matches!(version, Version::Draft14) && !self.has_priority {
+			return Err(EncodeError::Version);
+		}
 		if self.has_subgroup && self.has_subgroup_object {
 			return Err(EncodeError::InvalidState);
 		}
@@ -237,6 +240,8 @@ impl GroupFlags {
 
 		let (has_priority, base_id) = if (Self::START..=Self::END).contains(&id) {
 			(true, id)
+		} else if matches!(version, Version::Draft14) {
+			return Err(DecodeError::Version);
 		} else if (Self::START_NO_PRIORITY..=Self::END_NO_PRIORITY).contains(&id) {
 			(false, id - (Self::START_NO_PRIORITY - Self::START))
 		} else {
@@ -572,27 +577,39 @@ mod tests {
 	#[test]
 	fn test_group_flags_no_priority_range() {
 		// v15: 0x30 range = same flags as 0x10 range but no priority
-		let flags = GroupFlags::decode(0x30, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x30, Version::Draft15).unwrap();
 		assert!(!flags.has_priority);
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x30);
+		assert_eq!(flags.encode(Version::Draft15).unwrap(), 0x30);
 
-		let flags = GroupFlags::decode(0x38, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x38, Version::Draft15).unwrap();
 		assert!(!flags.has_priority);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x38);
+		assert_eq!(flags.encode(Version::Draft15).unwrap(), 0x38);
 
-		let flags = GroupFlags::decode(0x3D, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x3D, Version::Draft15).unwrap();
 		assert!(!flags.has_priority);
 		assert!(flags.has_subgroup);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x3D);
+		assert_eq!(flags.encode(Version::Draft15).unwrap(), 0x3D);
+
+		// Draft14 has priority on every group header and cannot use this range.
+		assert!(GroupFlags::decode(0x30, Version::Draft14).is_err());
+		assert!(GroupFlags::decode(0x3D, Version::Draft14).is_err());
+		assert!(
+			GroupFlags {
+				has_priority: false,
+				..GroupFlags::default()
+			}
+			.encode(Version::Draft14)
+			.is_err()
+		);
 
 		// Invalid: Both has_subgroup and has_subgroup_object in no-priority range
-		assert!(GroupFlags::decode(0x36, Version::Draft14).is_err());
+		assert!(GroupFlags::decode(0x36, Version::Draft15).is_err());
 	}
 
 	/// Draft-18 introduces the FIRST_OBJECT bit (0x40) per spec §11.4.2.

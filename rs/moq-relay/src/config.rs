@@ -57,6 +57,20 @@ pub struct Config {
 	#[serde(default)]
 	pub internal: InternalConfig,
 
+	/// Attach the opt-in protocol-byte meter to URL-less inbound transports.
+	///
+	/// URL-bearing sessions are metered only when their `control_only=true` query
+	/// marker is present. URL-less sessions carry that marker in the SETUP path,
+	/// but must be explicitly enabled here because the factory cannot inspect the
+	/// path before the SETUP bytes are read. Defaults to disabled.
+	#[arg(
+		long = "protocol-bytes-url-less",
+		env = "MOQ_PROTOCOL_BYTES_URL_LESS",
+		value_name = "BOOL"
+	)]
+	#[serde(default)]
+	pub protocol_bytes_url_less: Option<bool>,
+
 	/// If provided, load the configuration from this file.
 	#[serde(default)]
 	pub file: Option<String>,
@@ -629,5 +643,20 @@ connect = ["https://peer.example/?namespace=room%2Frun%2Farea%2Feast"]
 			Some("127.0.0.1:9101".parse().unwrap()),
 			"TOML's internal.listen must not be clobbered by the CLI re-parse"
 		);
+	}
+
+	#[test]
+	fn cli_does_not_clobber_toml_protocol_bytes_url_less() {
+		let _env = EnvGuard::clear(&["MOQ_PROTOCOL_BYTES_URL_LESS"]);
+
+		let toml = "protocol_bytes_url_less = true\n";
+		let dir = std::env::temp_dir().join("moq-relay-config-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("protocol-bytes-url-less-toml-wins.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = Config::parse_and_merge(args).expect("config load");
+		assert_eq!(config.protocol_bytes_url_less, Some(true));
 	}
 }
