@@ -845,6 +845,9 @@ impl Side {
 pub struct Session {
 	/// `None` for the no-op context (disabled registry or a `default()` handle).
 	inner: Option<Arc<SessionInner>>,
+	/// Optional second context used by explicit measurement teeing. It is kept
+	/// separate so the primary session remains the source of truth for normal stats.
+	mirror: Option<Arc<SessionInner>>,
 }
 
 /// The shared state behind a [`Session`]. Its `Drop` (on the last clone) records
@@ -871,6 +874,24 @@ impl Session {
 				presence,
 				viewers: Mutex::new(HashMap::new()),
 			})),
+			mirror: None,
+		}
+	}
+
+	/// Combine a primary billing/statistics context with a session-scoped mirror.
+	/// Model events are recorded in both registries while the normal context remains
+	/// intact. Disabled contexts are elided without changing the active context.
+	pub fn tee(primary: Session, mirror: Session) -> Self {
+		match (primary.inner, mirror.inner) {
+			(Some(inner), Some(mirror)) => Self {
+				inner: Some(inner),
+				mirror: Some(mirror),
+			},
+			(Some(inner), None) | (None, Some(inner)) => Self {
+				inner: Some(inner),
+				mirror: None,
+			},
+			(None, None) => Self::default(),
 		}
 	}
 
@@ -895,11 +916,23 @@ impl Session {
 			.stats
 			.entry(&path)
 			.map(|entry| entry.tier(&inner.handle.tier));
+		let session = Session {
+			inner: Some(inner.clone()),
+			mirror: None,
+		};
+		let mirror = self.mirror.as_ref().map(|inner| {
+			let session = Session {
+				inner: Some(inner.clone()),
+				mirror: None,
+			};
+			Box::new(session.scope(path.clone(), side))
+		});
 		Scope {
-			session: self.clone(),
+			session,
 			counters,
 			side,
 			path,
+			mirror,
 		}
 	}
 
@@ -961,6 +994,7 @@ impl Drop for SessionInner {
 pub(crate) struct Meter {
 	counters: Option<Arc<TierCounters>>,
 	side: Side,
+	mirror: Option<Box<Meter>>,
 }
 
 impl Meter {
@@ -973,6 +1007,9 @@ impl Meter {
 		if let Some(counters) = self.counters() {
 			counters.groups.fetch_add(1, Ordering::Relaxed);
 		}
+		if let Some(mirror) = &self.mirror {
+			mirror.group();
+		}
 	}
 
 	/// Bump `frames` by `n`.
@@ -982,6 +1019,9 @@ impl Meter {
 		}
 		if let Some(counters) = self.counters() {
 			counters.frames.fetch_add(n, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.frames(n);
 		}
 	}
 
@@ -995,6 +1035,9 @@ impl Meter {
 			counters.frames.fetch_add(1, Ordering::Relaxed);
 			counters.bytes.fetch_add(n, Ordering::Relaxed);
 		}
+		if let Some(mirror) = &self.mirror {
+			mirror.datagram(n);
+		}
 	}
 
 	/// Bump `bytes` by `n`.
@@ -1004,6 +1047,9 @@ impl Meter {
 		}
 		if let Some(counters) = self.counters() {
 			counters.bytes.fetch_add(n, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.bytes(n);
 		}
 	}
 }
@@ -1022,6 +1068,8 @@ pub(crate) struct Scope {
 	/// Absolute broadcast path, used to key the viewer refcount and as the
 	/// `announced_bytes` length.
 	path: PathOwned,
+	/// A second scope used by explicit measurement teeing.
+	mirror: Option<Box<Scope>>,
 }
 
 impl Scope {
@@ -1034,6 +1082,7 @@ impl Scope {
 		Meter {
 			counters: self.counters.clone(),
 			side: self.side,
+			mirror: self.mirror.as_ref().map(|scope| Box::new(scope.meter())),
 		}
 	}
 
@@ -1056,10 +1105,12 @@ impl Scope {
 		} else {
 			None
 		};
+		let mirror = self.mirror.as_ref().map(|scope| Box::new(scope.subscribe()));
 		Subscription {
 			counters: self.counters.clone(),
 			side: self.side,
 			viewer,
+			mirror,
 		}
 	}
 
@@ -1067,6 +1118,9 @@ impl Scope {
 	pub(crate) fn fetch(&self) {
 		if let Some(counters) = self.counters() {
 			counters.fetches.fetch_add(1, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.fetch();
 		}
 	}
 
@@ -1080,10 +1134,12 @@ impl Scope {
 			counters.announced.fetch_add(1, Ordering::Relaxed);
 			counters.announced_bytes.fetch_add(len, Ordering::Relaxed);
 		}
+		let mirror = self.mirror.as_ref().map(|scope| Box::new(scope.announce()));
 		Announce {
 			counters: self.counters.clone(),
 			side: self.side,
 			len,
+			mirror,
 		}
 	}
 }
@@ -1097,6 +1153,8 @@ pub(crate) struct Subscription {
 	side: Side,
 	/// `Some((session, path))` on the egress side, to release the viewer refcount.
 	viewer: Option<(Session, PathOwned)>,
+	/// A mirrored guard for explicit measurement teeing.
+	mirror: Option<Box<Subscription>>,
 }
 
 impl Drop for Subscription {
@@ -1118,6 +1176,7 @@ impl Drop for Subscription {
 				.subscriptions_closed
 				.fetch_add(1, Ordering::Release);
 		}
+		drop(self.mirror.take());
 	}
 }
 
@@ -1127,6 +1186,8 @@ pub(crate) struct Announce {
 	counters: Option<Arc<TierCounters>>,
 	side: Side,
 	len: u64,
+	/// A mirrored guard for explicit measurement teeing.
+	mirror: Option<Box<Announce>>,
 }
 
 impl Drop for Announce {
@@ -1137,6 +1198,7 @@ impl Drop for Announce {
 			// Release pairs with the readout's Acquire load of `announced_closed`.
 			counters.announced_closed.fetch_add(1, Ordering::Release);
 		}
+		drop(self.mirror.take());
 	}
 }
 
@@ -1177,6 +1239,27 @@ mod tests {
 
 	fn test_stats() -> Registry {
 		Registry::new(Config::new().with_exclude(".stats"))
+	}
+
+	#[test]
+	fn tee_mirrors_model_counters_without_replacing_primary_stats() {
+		let primary = test_stats();
+		let mirror = test_stats();
+		let primary_session = primary.tier(Tier::default()).session("primary");
+		let mirror_session = mirror.tier(Tier::default()).session("measurement");
+		let combined = Session::tee(primary_session, mirror_session);
+
+		let meter = combined.ingress("demo/tee").meter();
+		meter.bytes(42);
+		meter.frames(2);
+		meter.group();
+
+		for stats in [&primary, &mirror] {
+			let counters = tier_counters(stats, "demo/tee", &Tier::default());
+			assert_eq!(counters.subscriber.bytes.load(Relaxed), 42);
+			assert_eq!(counters.subscriber.frames.load(Relaxed), 2);
+			assert_eq!(counters.subscriber.groups.load(Relaxed), 1);
+		}
 	}
 
 	#[test]

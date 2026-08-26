@@ -138,6 +138,20 @@ impl ProtocolFamily {
 			None => Self::Unknown,
 		}
 	}
+
+	fn from_version(version: crate::Version) -> Self {
+		match version {
+			crate::Version::Lite(_) => Self::Lite,
+			crate::Version::Ietf(version) => Self::Ietf(match version {
+				crate::ietf::Version::Draft14 => IetfVersion::Draft14,
+				crate::ietf::Version::Draft15 => IetfVersion::Draft15,
+				crate::ietf::Version::Draft16 => IetfVersion::Draft16,
+				crate::ietf::Version::Draft17 => IetfVersion::Draft17,
+				crate::ietf::Version::Draft18 => IetfVersion::Draft18,
+				crate::ietf::Version::Draft19 => IetfVersion::Draft19,
+			}),
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -151,7 +165,7 @@ struct ClassifierState {
 #[derive(Debug)]
 struct StreamClassifier {
 	kind: StreamKind,
-	family: ProtocolFamily,
+	family: Arc<Mutex<ProtocolFamily>>,
 	state: Mutex<ClassifierState>,
 }
 
@@ -164,7 +178,12 @@ struct ClassificationDelta {
 }
 
 impl StreamClassifier {
+	#[cfg(test)]
 	fn new(kind: StreamKind, family: ProtocolFamily) -> Self {
+		Self::with_family(kind, Arc::new(Mutex::new(family)))
+	}
+
+	fn with_family(kind: StreamKind, family: Arc<Mutex<ProtocolFamily>>) -> Self {
 		Self {
 			kind,
 			family,
@@ -185,6 +204,7 @@ impl StreamClassifier {
 			return None;
 		}
 
+		let family = *self.family.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		if let Some(class) = state.class {
 			return Some(ClassificationDelta {
@@ -194,7 +214,7 @@ impl StreamClassifier {
 			});
 		}
 
-		if self.family == ProtocolFamily::Unknown {
+		if family == ProtocolFamily::Unknown {
 			state.class = Some(ByteClass::Unclassified);
 			return Some(ClassificationDelta {
 				class: ByteClass::Unclassified,
@@ -210,7 +230,7 @@ impl StreamClassifier {
 		state.prefix[prefix_start..prefix_start + available].copy_from_slice(&bytes[..available]);
 		state.prefix_len += available;
 
-		let Some(expected) = varint_len(state.prefix[0], self.family) else {
+		let Some(expected) = varint_len(state.prefix[0], family) else {
 			state.class = Some(ByteClass::Unclassified);
 			state.pending_bytes = 0;
 			return Some(ClassificationDelta {
@@ -227,8 +247,8 @@ impl StreamClassifier {
 			});
 		}
 
-		let value = decode_prefix(&state.prefix[..expected], self.family);
-		let class = match self.family {
+		let value = decode_prefix(&state.prefix[..expected], family);
+		let class = match family {
 			ProtocolFamily::Lite => classify_lite_stream(self.kind, value),
 			ProtocolFamily::SharedMoql => classify_shared_moql(self.kind, value),
 			ProtocolFamily::Ietf(version) => classify_ietf_stream(version, self.kind, value),
@@ -460,11 +480,30 @@ fn add_class(control: &mut u64, data: &mut u64, unclassified: &mut u64, delta: C
 pub struct MeteredSession<S> {
 	inner: S,
 	bytes: Option<ProtocolBytes>,
+	family_state: Option<Arc<Mutex<ProtocolFamily>>>,
 }
 
 impl<S> MeteredSession<S> {
-	pub(crate) fn new(inner: S, bytes: Option<ProtocolBytes>) -> Self {
-		Self { inner, bytes }
+	pub(crate) fn new(inner: S, bytes: Option<ProtocolBytes>) -> Self
+	where
+		S: TransportSession,
+	{
+		let family_state = bytes
+			.as_ref()
+			.map(|_| Arc::new(Mutex::new(ProtocolFamily::from_protocol(inner.protocol()))));
+		Self {
+			inner,
+			bytes,
+			family_state,
+		}
+	}
+
+	/// Publish the version selected by the SETUP negotiation to classifiers created
+	/// from this session. A session with metering disabled has no state to update.
+	pub(crate) fn set_version(&self, version: crate::Version) {
+		if let Some(family) = &self.family_state {
+			*family.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ProtocolFamily::from_version(version);
+		}
 	}
 }
 
@@ -676,13 +715,6 @@ impl<S: TransportSession> TransportSession for MeteredSession<S> {
 }
 
 impl<S> MeteredSession<S> {
-	fn family(&self) -> ProtocolFamily
-	where
-		S: TransportSession,
-	{
-		ProtocolFamily::from_protocol(self.inner.protocol())
-	}
-
 	fn wrap_send(&self, inner: S::SendStream, kind: StreamKind) -> MeteredSendStream<S::SendStream>
 	where
 		S: TransportSession,
@@ -709,9 +741,9 @@ impl<S> MeteredSession<S> {
 	where
 		S: TransportSession,
 	{
-		self.bytes
+		self.family_state
 			.as_ref()
-			.map(|_| Arc::new(StreamClassifier::new(kind, self.family())))
+			.map(|family| Arc::new(StreamClassifier::with_family(kind, family.clone())))
 	}
 }
 
@@ -862,6 +894,45 @@ mod tests {
 				reclassify_unclassified: 0,
 			})
 		);
+	}
+
+	#[test]
+	fn negotiated_family_is_used_for_new_streams() {
+		let family = Arc::new(Mutex::new(ProtocolFamily::SharedMoql));
+		let bytes = ProtocolBytes::enabled();
+
+		let shared = StreamClassifier::with_family(StreamKind::Uni, family.clone());
+		bytes.sent_stream(&shared, &[0x10, 0x01]);
+		assert_eq!(bytes.snapshot().data_bytes_sent, 2);
+
+		*family.lock().unwrap() = ProtocolFamily::from_version(crate::Version::Lite(crate::lite::Version::Lite01));
+		let lite = StreamClassifier::with_family(StreamKind::Uni, family.clone());
+		bytes.sent_stream(&lite, &[0x10, 0x01]);
+		assert_eq!(bytes.snapshot().data_bytes_sent, 2);
+		assert_eq!(bytes.snapshot().unclassified_bytes_sent, 2);
+
+		*family.lock().unwrap() = ProtocolFamily::from_version(crate::Version::Ietf(crate::ietf::Version::Draft14));
+		let ietf = StreamClassifier::with_family(StreamKind::Uni, family);
+		bytes.sent_stream(&ietf, &[0x10, 0x01]);
+		assert_eq!(bytes.snapshot().data_bytes_sent, 4);
+		assert_eq!(bytes.snapshot().unclassified_bytes_sent, 2);
+	}
+
+	#[test]
+	fn negotiated_family_update_reclassifies_split_prefix_without_double_counting() {
+		let family = Arc::new(Mutex::new(ProtocolFamily::SharedMoql));
+		let bytes = ProtocolBytes::enabled();
+		let stream = StreamClassifier::with_family(StreamKind::Uni, family.clone());
+
+		bytes.received_stream(&stream, &[0x40]);
+		assert_eq!(bytes.snapshot().unclassified_bytes_received, 1);
+
+		*family.lock().unwrap() = ProtocolFamily::from_version(crate::Version::Lite(crate::lite::Version::Lite01));
+		bytes.received_stream(&stream, &[0x10]);
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.bytes_received, 2);
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 2);
 	}
 
 	#[test]
@@ -1268,6 +1339,30 @@ mod tests {
 		fn stats(&self) -> impl Stats {
 			TestStats
 		}
+	}
+
+	#[test]
+	fn metered_session_publishes_negotiated_version_to_stream_classifiers() {
+		let mut transport = DatagramSession::new(true, Ok(Bytes::from_static(b"recv")));
+		transport.protocol = Some(crate::ALPN_LITE);
+		let bytes = ProtocolBytes::enabled();
+		let session = MeteredSession::new(transport, Some(bytes.clone()));
+
+		let split = session.classifier(StreamKind::Uni).unwrap();
+		bytes.received_stream(&split, &[0x40]);
+		session.set_version(crate::Version::Lite(crate::lite::Version::Lite01));
+		bytes.received_stream(&split, &[0x10]);
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.bytes_received, 2);
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 2);
+
+		session.set_version(crate::Version::Ietf(crate::ietf::Version::Draft14));
+		let ietf = session.classifier(StreamKind::Uni).unwrap();
+		bytes.sent_stream(&ietf, &[0x10, 0x01]);
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.data_bytes_sent, 2);
+		assert_eq!(snapshot.unclassified_bytes_sent, 0);
 	}
 
 	#[test]

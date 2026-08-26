@@ -396,7 +396,9 @@ impl<S: web_transport_trait::Session> Request<S> {
 	fn inner_mut(&mut self) -> &mut RequestInner<S> {
 		self.inner.as_mut().expect("request already responded")
 	}
+}
 
+impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 	/// Accept the session, returning the [`Session`] and the [`Driver`] that runs
 	/// its protocol work.
 	pub async fn ok(mut self) -> Result<(Session, Driver), Error> {
@@ -513,6 +515,10 @@ impl<S: web_transport_trait::Session> Request<S> {
 			parameters,
 		};
 		stream.writer.encode(&server_setup).await?;
+		// Do not publish a legacy version until the server SETUP was accepted by the
+		// transport. The SETUP itself is control in both legacy families; subsequent
+		// streams must use the negotiated classifier.
+		session.set_version(version);
 
 		let (recv_bw, protocol) = match version {
 			Version::Lite(v) => {
@@ -557,7 +563,9 @@ impl<S: web_transport_trait::Session> Request<S> {
 			server.protocol_bytes.clone(),
 		))
 	}
+}
 
+impl<S: web_transport_trait::Session> Request<S> {
 	/// Reject the session, closing the transport with `err`'s wire code.
 	pub fn close(mut self, err: Error) {
 		let inner = self.inner.take().expect("request already responded");
@@ -597,7 +605,7 @@ mod tests {
 		sync::{Arc, Mutex},
 	};
 
-	use crate::ALPN_LITE_05;
+	use crate::{ALPN_LITE, ALPN_LITE_05};
 	use bytes::Bytes;
 
 	#[derive(Debug, Clone, Default)]
@@ -620,14 +628,49 @@ mod tests {
 	struct FakeSession {
 		protocol: Option<&'static str>,
 		uni: Arc<Mutex<VecDeque<Vec<u8>>>>,
+		legacy_bi: Arc<Mutex<Option<(FakeSend, FakeRecv)>>>,
+		uni_read_notify: Arc<tokio::sync::Notify>,
 	}
 
 	impl FakeSession {
 		fn new(protocol: &'static str, uni: impl IntoIterator<Item = Vec<u8>>) -> Self {
+			Self::with_parts(protocol, None, uni)
+		}
+
+		fn with_legacy_bi(
+			protocol: &'static str,
+			client_setup: Vec<u8>,
+			uni: impl IntoIterator<Item = Vec<u8>>,
+		) -> Self {
+			Self::with_parts(
+				protocol,
+				Some((
+					FakeSend,
+					FakeRecv {
+						data: client_setup.into(),
+						read_notify: None,
+						hold_open: true,
+					},
+				)),
+				uni,
+			)
+		}
+
+		fn with_parts(
+			protocol: &'static str,
+			legacy_bi: Option<(FakeSend, FakeRecv)>,
+			uni: impl IntoIterator<Item = Vec<u8>>,
+		) -> Self {
 			Self {
 				protocol: Some(protocol),
 				uni: Arc::new(Mutex::new(uni.into_iter().collect())),
+				legacy_bi: Arc::new(Mutex::new(legacy_bi)),
+				uni_read_notify: Arc::new(tokio::sync::Notify::new()),
 			}
+		}
+
+		fn uni_read_notification(&self) -> Arc<tokio::sync::Notify> {
+			self.uni_read_notify.clone()
 		}
 	}
 
@@ -640,12 +683,20 @@ mod tests {
 			// Drop the guard before any await so the future stays Send.
 			let data = self.uni.lock().unwrap().pop_front();
 			match data {
-				Some(data) => Ok(FakeRecv { data: data.into() }),
+				Some(data) => Ok(FakeRecv {
+					data: data.into(),
+					read_notify: Some(self.uni_read_notify.clone()),
+					hold_open: false,
+				}),
 				None => std::future::pending().await,
 			}
 		}
 		async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-			std::future::pending().await
+			let pair = self.legacy_bi.lock().unwrap().take();
+			match pair {
+				Some(pair) => Ok(pair),
+				None => std::future::pending().await,
+			}
 		}
 		async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
 			std::future::pending().await
@@ -690,16 +741,24 @@ mod tests {
 
 	struct FakeRecv {
 		data: VecDeque<u8>,
+		read_notify: Option<Arc<tokio::sync::Notify>>,
+		hold_open: bool,
 	}
 	impl web_transport_trait::RecvStream for FakeRecv {
 		type Error = FakeError;
 		async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
 			if self.data.is_empty() {
+				if self.hold_open {
+					return std::future::pending().await;
+				}
 				return Ok(None);
 			}
 			let size = dst.len().min(self.data.len());
 			for slot in dst.iter_mut().take(size) {
 				*slot = self.data.pop_front().unwrap();
+			}
+			if let Some(notify) = &self.read_notify {
+				notify.notify_one();
 			}
 			Ok(Some(size))
 		}
@@ -726,6 +785,18 @@ mod tests {
 		buf
 	}
 
+	/// Encode the legacy client SETUP used by the shared `moql` ALPN.
+	fn legacy_client_setup(version: Version) -> Vec<u8> {
+		let mut buf = Vec::new();
+		setup::Client {
+			versions: vec![version].into(),
+			parameters: Bytes::new(),
+		}
+		.encode(&mut buf, Version::Ietf(ietf::Version::Draft14))
+		.unwrap();
+		buf
+	}
+
 	/// Encode a draft-17+ Setup Stream: the unified SETUP message, whose parameters
 	/// carry the request path the same way lite-05's does.
 	fn ietf_setup(version: ietf::Version, path: Option<&str>) -> Vec<u8> {
@@ -740,6 +811,36 @@ mod tests {
 			.encode(&mut buf, crate::Version::Ietf(version))
 			.unwrap();
 		buf
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn accept_legacy_lite_meter_uses_negotiated_classifier_for_post_setup_uni() {
+		let fake = FakeSession::with_legacy_bi(
+			ALPN_LITE,
+			legacy_client_setup(Version::Lite(lite::Version::Lite01)),
+			[vec![0x10, 0x01]],
+		);
+		let uni_read = fake.uni_read_notification();
+		let notified = uni_read.notified();
+		let bytes = ProtocolBytes::enabled();
+		let request = Server::new()
+			.with_versions(Version::Lite(lite::Version::Lite01).into())
+			.with_protocol_bytes(bytes.clone())
+			.accept_request(fake)
+			.await
+			.unwrap();
+
+		let (session, driver) = request.ok().await.unwrap();
+		let driver = tokio::spawn(driver);
+		notified.await;
+
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 2);
+		assert!(snapshot.control_bytes_received > 0);
+
+		driver.abort();
+		drop(session);
 	}
 
 	#[tokio::test(start_paused = true)]

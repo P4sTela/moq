@@ -397,6 +397,9 @@ impl Client {
 			.find(|v| coding::Version::from(**v) == server.version)
 			.copied()
 			.ok_or(Error::Version)?;
+		// The bidi SETUP was metered while the ALPN was still ambiguous. Publish the
+		// negotiated version before any post-SETUP stream is created.
+		session.set_version(version);
 
 		let (recv_bw, protocol, connecting) = match version {
 			Version::Lite(v) => {
@@ -496,6 +499,8 @@ mod tests {
 	struct FakeSessionState {
 		protocol: Option<&'static str>,
 		control_stream: Mutex<Option<(FakeSendStream, FakeRecvStream)>>,
+		uni_streams: Mutex<VecDeque<Vec<u8>>>,
+		uni_read_notify: Arc<tokio::sync::Notify>,
 		close_events: Mutex<Vec<(u32, String)>>,
 		close_notify: tokio::sync::Notify,
 		control_writes: Arc<Mutex<Vec<u8>>>,
@@ -504,14 +509,35 @@ mod tests {
 
 	impl FakeSession {
 		fn new(protocol: Option<&'static str>, server_control_bytes: Vec<u8>) -> Self {
+			Self::with_uni_internal(protocol, server_control_bytes, Vec::new(), false)
+		}
+
+		fn with_uni(
+			protocol: Option<&'static str>,
+			server_control_bytes: Vec<u8>,
+			uni_streams: impl IntoIterator<Item = Vec<u8>>,
+		) -> Self {
+			Self::with_uni_internal(protocol, server_control_bytes, uni_streams, true)
+		}
+
+		fn with_uni_internal(
+			protocol: Option<&'static str>,
+			server_control_bytes: Vec<u8>,
+			uni_streams: impl IntoIterator<Item = Vec<u8>>,
+			hold_control_open: bool,
+		) -> Self {
 			let writes = Arc::new(Mutex::new(Vec::new()));
 			let send = FakeSendStream { writes: writes.clone() };
 			let recv = FakeRecvStream {
 				data: VecDeque::from(server_control_bytes),
+				read_notify: None,
+				hold_open: hold_control_open,
 			};
 			let state = FakeSessionState {
 				protocol,
 				control_stream: Mutex::new(Some((send, recv))),
+				uni_streams: Mutex::new(uni_streams.into_iter().collect()),
+				uni_read_notify: Arc::new(tokio::sync::Notify::new()),
 				close_events: Mutex::new(Vec::new()),
 				close_notify: tokio::sync::Notify::new(),
 				control_writes: writes,
@@ -526,6 +552,10 @@ mod tests {
 
 		fn control_writes(&self) -> Vec<u8> {
 			self.state.control_writes.lock().unwrap().clone()
+		}
+
+		fn uni_read_notification(&self) -> Arc<tokio::sync::Notify> {
+			self.state.uni_read_notify.clone()
 		}
 
 		async fn wait_for_first_close(&self) -> (u32, String) {
@@ -545,7 +575,15 @@ mod tests {
 		type Error = FakeError;
 
 		async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-			std::future::pending().await
+			let data = self.state.uni_streams.lock().unwrap().pop_front();
+			match data {
+				Some(data) => Ok(FakeRecvStream {
+					data: data.into(),
+					read_notify: Some(self.state.uni_read_notify.clone()),
+					hold_open: false,
+				}),
+				None => std::future::pending().await,
+			}
 		}
 
 		async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
@@ -636,6 +674,8 @@ mod tests {
 
 	struct FakeRecvStream {
 		data: VecDeque<u8>,
+		read_notify: Option<Arc<tokio::sync::Notify>>,
+		hold_open: bool,
 	}
 
 	impl web_transport_trait::RecvStream for FakeRecvStream {
@@ -643,12 +683,18 @@ mod tests {
 
 		async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
 			if self.data.is_empty() {
+				if self.hold_open {
+					return std::future::pending().await;
+				}
 				return Ok(None);
 			}
 
 			let size = dst.len().min(self.data.len());
 			for slot in dst.iter_mut().take(size) {
 				*slot = self.data.pop_front().unwrap();
+			}
+			if let Some(notify) = &self.read_notify {
+				notify.notify_one();
 			}
 			Ok(Some(size))
 		}
@@ -736,6 +782,39 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn no_alpn_falls_back_to_draft14_and_switches_version_post_setup() {
 		run_alpn_lite_fallback_case(None).await;
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn alpn_lite_meter_uses_negotiated_lite_classifier_for_post_setup_uni() {
+		let fake = FakeSession::with_uni(
+			Some(ALPN_LITE),
+			mock_server_setup(Version::Lite(lite::Version::Lite01)),
+			[vec![0x10, 0x01]],
+		);
+		let uni_read = fake.uni_read_notification();
+		let notified = uni_read.notified();
+		let bytes = ProtocolBytes::enabled();
+		let client = Client::new()
+			.with_versions(
+				[
+					Version::Lite(lite::Version::Lite01),
+					Version::Ietf(ietf::Version::Draft14),
+				]
+				.into(),
+			)
+			.with_protocol_bytes(bytes.clone());
+
+		let (session, driver) = client.connect(fake).await.unwrap();
+		let driver = tokio::spawn(driver);
+		notified.await;
+
+		let snapshot = bytes.snapshot();
+		assert_eq!(snapshot.data_bytes_received, 0);
+		assert_eq!(snapshot.unclassified_bytes_received, 2);
+		assert!(snapshot.control_bytes_received > 0);
+
+		driver.abort();
+		drop(session);
 	}
 
 	#[tokio::test(start_paused = true)]
