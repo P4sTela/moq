@@ -1,8 +1,9 @@
-//! Structured telemetry for observation-only inbound and outbound cluster sessions.
+//! Structured telemetry for explicitly measured inbound and outbound sessions.
 //!
 //! This is deliberately separate from the relay-wide model traffic registry:
-//! Claim C needs a connection-scoped record that can say both what the transport
-//! carried and whether a model data path was attached to that connection.
+//! experiments need a connection-scoped record that can say both what the transport
+//! carried and whether a model data path was attached to that connection. Control-only
+//! and normal data-session records are kept in separate registries and artifacts.
 
 use std::{
 	collections::{BTreeMap, VecDeque},
@@ -16,6 +17,7 @@ use moq_net::{
 use serde::Serialize;
 
 pub(crate) const CONTROL_ONLY_QUERY: &str = "control_only";
+pub(crate) const PROTOCOL_BYTES_QUERY: &str = "protocol_bytes";
 pub(crate) const NAMESPACE_QUERY: &str = "namespace";
 
 const SCHEMA_VERSION: u32 = 4;
@@ -81,9 +83,40 @@ impl Registry {
 		remote_namespace: Option<String>,
 		model_registry: ModelRegistry,
 	) -> Handle {
+		self.begin_kind(
+			"control_only",
+			id,
+			direction,
+			peer_url,
+			remote_namespace,
+			model_registry,
+		)
+	}
+
+	pub(crate) fn begin_data(
+		&self,
+		id: u64,
+		direction: Direction,
+		peer_url: String,
+		remote_namespace: Option<String>,
+		model_registry: ModelRegistry,
+	) -> Handle {
+		self.begin_kind("data", id, direction, peer_url, remote_namespace, model_registry)
+	}
+
+	fn begin_kind(
+		&self,
+		kind: &'static str,
+		id: u64,
+		direction: Direction,
+		peer_url: String,
+		remote_namespace: Option<String>,
+		model_registry: ModelRegistry,
+	) -> Handle {
 		let record = Record {
 			connection_id: id,
 			direction,
+			kind,
 			peer_url,
 			remote_namespace,
 			state: State::Connecting,
@@ -181,6 +214,7 @@ impl Drop for Handle {
 struct Record {
 	connection_id: u64,
 	direction: Direction,
+	kind: &'static str,
 	peer_url: String,
 	remote_namespace: Option<String>,
 	state: State,
@@ -198,7 +232,7 @@ impl Record {
 		Snapshot {
 			connection_id: self.connection_id,
 			direction: self.direction,
-			kind: "control_only",
+			kind: self.kind,
 			peer_url: self.peer_url.clone(),
 			remote_namespace: self.remote_namespace.clone(),
 			state: self.state,
@@ -342,10 +376,12 @@ mod tests {
 
 	#[test]
 	fn query_markers_are_decoded_and_credentials_are_removed() {
-		let url =
-			url::Url::parse("https://peer.example/anon?jwt=secret&control_only=true&namespace=observation%2Fdiagonal")
-				.expect("parse test URL");
+		let url = url::Url::parse(
+			"https://peer.example/anon?jwt=secret&control_only=true&protocol_bytes=true&namespace=observation%2Fdiagonal",
+		)
+		.expect("parse test URL");
 		assert!(query_flag(&url, CONTROL_ONLY_QUERY));
+		assert!(query_flag(&url, PROTOCOL_BYTES_QUERY));
 		assert_eq!(
 			query_value(&url, NAMESPACE_QUERY).as_deref(),
 			Some("observation/diagonal")

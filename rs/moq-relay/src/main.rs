@@ -38,18 +38,21 @@ async fn main() -> anyhow::Result<()> {
 		None => (server, client),
 	};
 
-	// Create the protocol-byte meter before native Server parses SETUP, so inbound
-	// control-only evidence includes the peer's initial handshake bytes. URL-less
-	// transports need an explicit opt-in because the factory cannot inspect their
-	// SETUP path until after the meter must already be attached.
+	// Create the protocol-byte meter before native Server parses SETUP, so the
+	// initial handshake bytes are never lost. URL-less transports require the
+	// node-level gate because the factory cannot inspect their SETUP path until
+	// after the meter must already be attached.
 	let protocol_bytes_url_less = config.protocol_bytes_url_less.unwrap_or(false);
+	let protocol_bytes = config.protocol_bytes.unwrap_or(false);
 	let server = server.with_protocol_bytes_factory(move |url| {
 		if url.is_none() {
-			return protocol_bytes_url_less.then(moq_net::ProtocolBytes::enabled);
+			return (protocol_bytes_url_less || protocol_bytes).then(moq_net::ProtocolBytes::enabled);
 		}
 		url.filter(|url| {
-			url.query_pairs()
-				.any(|(key, value)| key == "control_only" && value == "true")
+			protocol_bytes
+				|| url
+					.query_pairs()
+					.any(|(key, value)| (key == "control_only" || key == "protocol_bytes") && value == "true")
 		})
 		.map(|_| moq_net::ProtocolBytes::enabled())
 	});
@@ -73,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let cache = config.cache.init()?;
 	let cluster = Cluster::new(config.cluster)?
+		.with_protocol_bytes_data(protocol_bytes)
 		.with_cache(cache)
 		.with_client(client)
 		.with_client_tls(config.client.tls.build()?);

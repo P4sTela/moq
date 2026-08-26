@@ -90,7 +90,9 @@ fn has_unsupported_cluster_marker(uri: &Uri) -> bool {
 		url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| {
 			matches!(
 				key.as_ref(),
-				crate::control_telemetry::CONTROL_ONLY_QUERY | crate::control_telemetry::NAMESPACE_QUERY
+				crate::control_telemetry::CONTROL_ONLY_QUERY
+					| crate::control_telemetry::PROTOCOL_BYTES_QUERY
+					| crate::control_telemetry::NAMESPACE_QUERY
 			)
 		})
 	})
@@ -354,6 +356,9 @@ mod tests {
 		));
 		assert!(has_unsupported_cluster_marker(
 			&"/?namespace=observation%2Fdiagonal".parse().unwrap()
+		));
+		assert!(has_unsupported_cluster_marker(
+			&"/?protocol_bytes=true".parse().unwrap()
 		));
 		assert!(!has_unsupported_cluster_marker(
 			&"/anon?jwt=token&role=publisher".parse().unwrap()

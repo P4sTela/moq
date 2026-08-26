@@ -428,14 +428,35 @@ async fn spawn_accept_relay_with_options(
 	tokio::task::JoinHandle<()>,
 	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
 ) {
+	spawn_accept_relay_with_measurement(
+		config,
+		auth_config,
+		cluster_config,
+		enable_url_less_protocol_bytes,
+		false,
+	)
+	.await
+}
+
+async fn spawn_accept_relay_with_measurement(
+	config: moq_native::ServerConfig,
+	auth_config: AuthConfig,
+	cluster_config: ClusterConfig,
+	enable_url_less_protocol_bytes: bool,
+	enable_data_measurement: bool,
+) -> (
+	Option<std::net::SocketAddr>,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
 	let mut server = config.init().expect("server init");
 	let protocol_bytes = Arc::new(Mutex::new(Vec::new()));
-	if enable_url_less_protocol_bytes {
+	if enable_url_less_protocol_bytes || enable_data_measurement {
 		let protocol_bytes_capture = protocol_bytes.clone();
 		server = server.with_protocol_bytes_factory(move |url| {
-			if url.is_some() {
+			if url.is_some() && !enable_data_measurement {
 				return None;
 			}
 			let bytes = moq_net::ProtocolBytes::enabled();
@@ -453,7 +474,9 @@ async fn spawn_accept_relay_with_options(
 		.await
 		.expect("auth init");
 
-	let cluster = Cluster::new(cluster_config).expect("cluster init");
+	let cluster = Cluster::new(cluster_config)
+		.expect("cluster init")
+		.with_protocol_bytes_data(enable_data_measurement);
 
 	let handle = tokio::spawn(async move {
 		let mut id = 0;
@@ -917,6 +940,24 @@ async fn spawn_control_only_quic_relay(
 	(addr.expect("relay bound no QUIC socket"), handle, protocol_bytes)
 }
 
+async fn spawn_data_measurement_quic_relay() -> (
+	std::net::SocketAddr,
+	tokio::task::JoinHandle<()>,
+	Arc<Mutex<Vec<moq_net::ProtocolBytes>>>,
+) {
+	let mut config = moq_native::ServerConfig::default();
+	config.bind = Some("127.0.0.1:0".to_string());
+	config.tls.generate = vec!["localhost".into()];
+
+	#[allow(deprecated)]
+	let public = PublicConfig::Simple(vec![String::new()]);
+	let mut auth_config = AuthConfig::default();
+	auth_config.public = Some(public);
+	let (addr, handle, protocol_bytes) =
+		spawn_accept_relay_with_measurement(config, auth_config, ClusterConfig::default(), false, true).await;
+	(addr.expect("relay bound no QUIC socket"), handle, protocol_bytes)
+}
+
 /// Raw QUIC has no request URI either, so `moqt://host:port/<path>` only reaches the
 /// relay if the client puts it in the SETUP. Same assertion as TCP: the relay scopes
 /// the publisher's grant to that root, across every version whose SETUP carries a path.
@@ -1070,6 +1111,144 @@ async fn raw_quic_control_only_path_requires_and_records_protocol_bytes() {
 		protocol_bytes.lock().expect("protocol bytes mutex").is_empty(),
 		"meter unexpectedly installed without opt-in"
 	);
+	drop(session);
+	handle.abort();
+}
+
+/// A normal URL-less data session opts into the dedicated measurement path with
+/// `protocol_bytes=true`. Its known IETF group stream must be counted as data,
+/// while the separate control-only tests above remain negative controls.
+#[tokio::test]
+async fn raw_quic_data_session_opt_in_records_positive_data_bytes() {
+	let version: moq_net::Version = "moq-transport-19".parse().expect("parse Draft19");
+	let (addr, handle, protocol_bytes) = spawn_control_only_quic_relay(true).await;
+	let url: url::Url = format!("moqt://{addr}/anon?protocol_bytes=true")
+		.parse()
+		.expect("parse raw data URL");
+
+	let pub_origin = Origin::random().produce();
+	let mut broadcast = pub_origin
+		.create_broadcast("metered", moq_net::broadcast::Route::new().with_announce(true))
+		.expect("create broadcast");
+	let mut track = broadcast.create_track("video", None).expect("create track");
+	let mut group = track.append_group().expect("append group");
+	group
+		.write_frame(moq_net::Timestamp::ZERO, b"metered-data".as_ref())
+		.expect("write frame");
+	group.finish().expect("finish group");
+
+	let pub_session = tokio::time::timeout(
+		TIMEOUT,
+		client_version(Some(version))
+			.with_publisher(pub_origin.consume())
+			.connect(url.clone()),
+	)
+	.await
+	.expect("data publisher connect timeout")
+	.expect("data publisher connect failed");
+
+	let sub_origin = Origin::random().produce();
+	let mut announcements = sub_origin.consume().announced();
+	let sub_session = tokio::time::timeout(
+		TIMEOUT,
+		client_version(Some(version)).with_subscriber(sub_origin).connect(url),
+	)
+	.await
+	.expect("data subscriber connect timeout")
+	.expect("data subscriber connect failed");
+
+	let moq_net::announce::Update { broadcast: bc, .. } = tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("data announcement timeout")
+		.expect("data origin closed");
+	let bc = bc.expect("expected metered broadcast announcement");
+	let mut track_sub = bc
+		.track("video")
+		.expect("find metered track")
+		.subscribe(None)
+		.await
+		.expect("subscribe");
+	let mut group_sub = tokio::time::timeout(TIMEOUT, track_sub.recv_group())
+		.await
+		.expect("data group timeout")
+		.expect("data group failed")
+		.expect("data track closed");
+	let frame = tokio::time::timeout(TIMEOUT, group_sub.read_frame())
+		.await
+		.expect("data frame timeout")
+		.expect("data frame failed")
+		.expect("data group closed");
+	assert_eq!(&frame.payload[..], b"metered-data");
+
+	let snapshot = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let snapshots: Vec<_> = protocol_bytes
+				.lock()
+				.expect("protocol bytes mutex")
+				.iter()
+				.map(moq_net::ProtocolBytes::snapshot)
+				.collect();
+			if let Some(snapshot) = snapshots
+				.iter()
+				.find(|snapshot| snapshot.data_bytes_sent > 0 || snapshot.data_bytes_received > 0)
+				.copied()
+			{
+				break snapshot;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("data session did not produce positive protocol data bytes");
+	assert!(snapshot.data_bytes_sent > 0 || snapshot.data_bytes_received > 0);
+	assert_eq!(snapshot.unclassified_bytes_sent, 0);
+	assert_eq!(snapshot.unclassified_bytes_received, 0);
+
+	drop(track);
+	drop(broadcast);
+	drop(pub_session);
+	drop(sub_session);
+	handle.abort();
+}
+
+/// The node-level `protocol_bytes` flag also enables URL-less regular sessions
+/// without requiring a per-URL marker. This is the explicit data-session gate
+/// used by the measurement-only relay configuration.
+#[tokio::test]
+async fn raw_quic_data_node_flag_attaches_meter_without_marker() {
+	let version: moq_net::Version = "moq-transport-19".parse().expect("parse Draft19");
+	let (addr, handle, protocol_bytes) = spawn_data_measurement_quic_relay().await;
+	let url: url::Url = format!("moqt://{addr}/anon").parse().expect("parse raw data URL");
+	let session = tokio::time::timeout(TIMEOUT, client_version(Some(version)).connect(url))
+		.await
+		.expect("data flag connect timeout")
+		.expect("data flag connect failed");
+
+	let snapshot = tokio::time::timeout(TIMEOUT, async {
+		loop {
+			let snapshots: Vec<_> = protocol_bytes
+				.lock()
+				.expect("protocol bytes mutex")
+				.iter()
+				.map(moq_net::ProtocolBytes::snapshot)
+				.collect();
+			if let Some(snapshot) = snapshots
+				.iter()
+				.find(|snapshot| snapshot.control_bytes_sent > 0 && snapshot.control_bytes_received > 0)
+				.copied()
+			{
+				break snapshot;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("node data flag did not attach a meter");
+	assert_eq!(snapshot.data_bytes_sent, 0);
+	assert_eq!(snapshot.data_bytes_received, 0);
+	assert_eq!(snapshot.unclassified_bytes_sent, 0);
+	assert_eq!(snapshot.unclassified_bytes_received, 0);
+
 	drop(session);
 	handle.abort();
 }

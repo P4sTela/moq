@@ -66,9 +66,10 @@ impl Connection {
 		// URL-bearing transports carry the local control-only markers in the dial URL.
 		// Raw QUIC and stream transports carry the same authenticated request target in
 		// SETUP, so recover the markers from Request::path() before authorization.
-		let (control_only, remote_namespace, peer_url) = match self.request.url() {
+		let (control_only, protocol_bytes_requested, remote_namespace, peer_url) = match self.request.url() {
 			Some(url) => (
 				crate::control_telemetry::query_flag(url, crate::control_telemetry::CONTROL_ONLY_QUERY),
+				crate::control_telemetry::query_flag(url, crate::control_telemetry::PROTOCOL_BYTES_QUERY),
 				crate::control_telemetry::query_value(url, crate::control_telemetry::NAMESPACE_QUERY),
 				Some(crate::control_telemetry::sanitized_url(url)),
 			),
@@ -76,6 +77,10 @@ impl Connection {
 				crate::control_telemetry::query_flag_in_path(
 					self.request.path(),
 					crate::control_telemetry::CONTROL_ONLY_QUERY,
+				),
+				crate::control_telemetry::query_flag_in_path(
+					self.request.path(),
+					crate::control_telemetry::PROTOCOL_BYTES_QUERY,
 				),
 				crate::control_telemetry::query_value_in_path(
 					self.request.path(),
@@ -101,7 +106,9 @@ impl Connection {
 		// scope is rejected here during the handshake, instead of being accepted and
 		// then silently carrying no media (the bug that motivated the role hint).
 		let role = self.request.role();
-		let protocol_bytes = if control_only {
+		let data_measurement =
+			!control_only && (self.cluster.protocol_bytes_data_enabled() || protocol_bytes_requested);
+		let protocol_bytes = if control_only || data_measurement {
 			self.request.protocol_bytes()
 		} else {
 			None
@@ -130,6 +137,12 @@ impl Connection {
 				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
 				anyhow::bail!("control-only cluster session must not advertise a data role");
 			}
+		} else if data_measurement && protocol_bytes.is_none() {
+			let _ = self
+				.request
+				.close(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+				.await;
+			anyhow::bail!("data session is missing protocol byte telemetry");
 		}
 		let authorized = match role {
 			Some(moq_net::Role::Publisher) => publish.is_some(),
@@ -168,9 +181,10 @@ impl Connection {
 			}
 		}
 
-		// Keep observation-only model counters in a private registry. This makes an
-		// inbound control-only record symmetric with the outbound record and prevents
-		// relay-wide application traffic from contaminating the evidence.
+		// Keep measurement model counters in a private registry so the artifact is
+		// session-scoped. Normal data sessions additionally tee those counters into
+		// the relay-wide billing registry; control-only sessions stay isolated.
+		let telemetry_peer_url = peer_url.unwrap_or_else(|| format!("transport:{transport}"));
 		let mut telemetry = None;
 		let stats = if control_only {
 			let model_registry = moq_net::stats::Registry::new(Default::default());
@@ -178,11 +192,23 @@ impl Connection {
 			telemetry = Some(self.cluster.control_sessions.begin(
 				self.id,
 				crate::control_telemetry::Direction::Inbound,
-				peer_url.unwrap_or_else(|| format!("transport:{transport}")),
-				remote_namespace,
+				telemetry_peer_url.clone(),
+				remote_namespace.clone(),
 				model_registry,
 			));
 			model_session
+		} else if data_measurement {
+			let model_registry = moq_net::stats::Registry::new(Default::default());
+			let model_session = model_registry.tier(self.cluster.cluster_tier()).session("");
+			let billing_session = self.cluster.stats.tier(token.tier.clone()).session(&token.root);
+			telemetry = Some(self.cluster.data_sessions.begin_data(
+				self.id,
+				crate::control_telemetry::Direction::Inbound,
+				telemetry_peer_url,
+				remote_namespace,
+				model_registry,
+			));
+			moq_net::stats::Session::tee(billing_session, model_session)
 		} else {
 			self.cluster.stats.tier(token.tier.clone()).session(&token.root)
 		};

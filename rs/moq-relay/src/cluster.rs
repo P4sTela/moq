@@ -420,6 +420,13 @@ pub struct Cluster {
 	/// Connection-scoped telemetry for observation-only inbound and outbound cluster
 	/// sessions. Legacy and normal namespace-filtered sessions do not enter this registry.
 	pub(crate) control_sessions: control_telemetry::Registry,
+
+	/// Connection-scoped telemetry for explicitly measured data-bearing sessions.
+	/// Kept separate from the control-only negative-control artifact.
+	pub(crate) data_sessions: control_telemetry::Registry,
+
+	/// Enables session-scoped measurement for normal data-bearing cluster sessions.
+	protocol_bytes_data: bool,
 }
 
 impl Cluster {
@@ -454,6 +461,8 @@ impl Cluster {
 			origin,
 			stats: moq_net::stats::Registry::disabled(),
 			control_sessions: control_telemetry::Registry::default(),
+			data_sessions: control_telemetry::Registry::default(),
+			protocol_bytes_data: false,
 		})
 	}
 
@@ -513,6 +522,20 @@ impl Cluster {
 	pub fn with_stats(mut self, stats: moq_net::stats::Registry) -> Self {
 		self.stats = stats;
 		self
+	}
+
+	/// Enable explicit measurement for normal data-bearing cluster sessions.
+	///
+	/// The measurement registry is separate from relay-wide stats and the
+	/// control-only negative-control artifact. Disabled by default.
+	pub fn with_protocol_bytes_data(mut self, enabled: bool) -> Self {
+		self.protocol_bytes_data = enabled;
+		self
+	}
+
+	/// Whether normal data-bearing sessions should emit measurement telemetry.
+	pub(crate) fn protocol_bytes_data_enabled(&self) -> bool {
+		self.protocol_bytes_data
 	}
 
 	/// Billing tier cluster-peer traffic records under (`--cluster-tier`).
@@ -977,6 +1000,11 @@ impl Cluster {
 		// dialing configuration, then reattached as an explicit request marker so
 		// the inbound relay can enforce the same no-publisher/no-subscriber policy.
 		let control_only = take_control_only(&mut url)?;
+		// `protocol_bytes=true` is an explicit per-session measurement request. The
+		// node-level flag below can enable the same measurement for every normal
+		// data-bearing cluster session.
+		let requested_protocol_bytes = take_protocol_bytes(&mut url)?;
+		let protocol_bytes = self.protocol_bytes_data_enabled() || requested_protocol_bytes;
 		// The link's price, declared by us as the dialing side and charged to
 		// every announcement crossing the connection (see
 		// `moq_net::Client::with_cost`). Carried as a `?cost=` query
@@ -999,6 +1027,10 @@ impl Cluster {
 				url.query_pairs_mut()
 					.append_pair(control_telemetry::NAMESPACE_QUERY, remote_namespace);
 			}
+		}
+		if protocol_bytes {
+			url.query_pairs_mut()
+				.append_pair(control_telemetry::PROTOCOL_BYTES_QUERY, "true");
 		}
 		if self.namespace_filter_enabled() {
 			let remote_namespace = remote_namespace
@@ -1027,7 +1059,7 @@ impl Cluster {
 		loop {
 			let started = tokio::time::Instant::now();
 			let result = self
-				.run_remote_once(&url, cost, remote_namespace.as_deref(), control_only)
+				.run_remote_once(&url, cost, remote_namespace.as_deref(), control_only, protocol_bytes)
 				.await;
 			let elapsed = started.elapsed();
 
@@ -1053,11 +1085,12 @@ impl Cluster {
 		cost: Option<u64>,
 		remote_namespace: Option<&str>,
 		control_only: bool,
+		protocol_bytes: bool,
 	) -> anyhow::Result<()> {
 		// Each attempt is its own session, so it gets its own id. Matches the span an
 		// accepted connection runs under, so both directions log the same way.
 		let id = self.next_connection_id();
-		self.run_remote_session(id, url, cost, remote_namespace, control_only)
+		self.run_remote_session(id, url, cost, remote_namespace, control_only, protocol_bytes)
 			.instrument(tracing::info_span!("conn", id))
 			.await
 	}
@@ -1069,6 +1102,7 @@ impl Cluster {
 		cost: Option<u64>,
 		remote_namespace: Option<&str>,
 		control_only: bool,
+		protocol_bytes: bool,
 	) -> anyhow::Result<()> {
 		let mut log_url = url.clone();
 		log_url.set_query(None);
@@ -1101,6 +1135,20 @@ impl Cluster {
 			);
 			client
 				.with_stats(model_session)
+				.with_protocol_bytes(moq_net::ProtocolBytes::enabled())
+		} else if protocol_bytes {
+			let model_registry = moq_net::stats::Registry::new(Default::default());
+			let model_session = model_registry.tier(self.cluster_tier()).session("");
+			let billing_session = self.stats.tier(self.cluster_tier()).session("");
+			telemetry = Some(self.data_sessions.begin_data(
+				id,
+				control_telemetry::Direction::Outbound,
+				log_url.to_string(),
+				remote_namespace.map(str::to_owned),
+				model_registry,
+			));
+			client
+				.with_stats(moq_net::stats::Session::tee(billing_session, model_session))
 				.with_protocol_bytes(moq_net::ProtocolBytes::enabled())
 		} else {
 			client.with_stats(self.stats.tier(self.cluster_tier()).session(""))
@@ -1187,6 +1235,37 @@ fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
 	}
 
 	Ok(Some(cost))
+}
+
+/// Extract and remove the per-session `protocol_bytes` query marker from a peer URL.
+///
+/// It is reattached below so the receiving relay can opt into the same
+/// connection-scoped data artifact. `false` is treated as an explicit absence.
+fn take_protocol_bytes(url: &mut Url) -> anyhow::Result<bool> {
+	let Some(value) = url
+		.query_pairs()
+		.find_map(|(key, value)| (key == control_telemetry::PROTOCOL_BYTES_QUERY).then(|| value.into_owned()))
+	else {
+		return Ok(false);
+	};
+	let enabled = match value.as_str() {
+		"true" => true,
+		"false" => false,
+		_ => anyhow::bail!("invalid protocol_bytes value {value:?}; expected true or false"),
+	};
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != control_telemetry::PROTOCOL_BYTES_QUERY)
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (key, value) in &remaining {
+			pairs.append_pair(key, value);
+		}
+	}
+	Ok(enabled)
 }
 
 /// Extract and remove the local-only `control_only` query param from a peer URL.
@@ -1378,6 +1457,20 @@ mod tests {
 
 		let mut url = Url::parse("https://peer.example/?control_only=maybe").unwrap();
 		assert!(take_control_only(&mut url).is_err());
+	}
+
+	#[test]
+	fn protocol_bytes_param_is_consumed() {
+		let mut url = Url::parse("https://peer.example/?jwt=abc&protocol_bytes=true").unwrap();
+		assert!(take_protocol_bytes(&mut url).unwrap());
+		assert_eq!(url.as_str(), "https://peer.example/?jwt=abc");
+
+		let mut url = Url::parse("https://peer.example/?protocol_bytes=false").unwrap();
+		assert!(!take_protocol_bytes(&mut url).unwrap());
+		assert_eq!(url.as_str(), "https://peer.example/");
+
+		let mut url = Url::parse("https://peer.example/?protocol_bytes=maybe").unwrap();
+		assert!(take_protocol_bytes(&mut url).is_err());
 	}
 
 	#[test]

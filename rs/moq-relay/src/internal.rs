@@ -16,7 +16,9 @@
 //! - `/nodes` - the cluster nodes visible through gossip plus established
 //!   direct relay connections.
 //! - `/cluster/control-sessions` - structured connection-scoped telemetry for
-//!   observation-only outbound cluster dials.
+//!   observation-only cluster dials.
+//! - `/cluster/data-sessions` - structured telemetry for explicitly measured
+//!   normal data-bearing sessions.
 //!
 //! Everything here is unauthenticated, so bind it only to a trusted plane -
 //! loopback for a co-located scraper/agent, or a private overlay address; see
@@ -45,8 +47,8 @@ use crate::control_telemetry::{Registry as ControlSessionRegistry, Telemetry as 
 #[non_exhaustive]
 pub struct InternalConfig {
 	/// Socket address for the internal listener (plain HTTP), serving the ops
-	/// endpoints (`/metrics`, `/health`, `/nodes`, and
-	/// `/cluster/control-sessions`).
+	/// endpoints (`/metrics`, `/health`, `/nodes`, `/cluster/control-sessions`,
+	/// and `/cluster/data-sessions`).
 	///
 	/// These endpoints are unauthenticated, so bind it only to a trusted plane:
 	/// loopback (e.g. `127.0.0.1:9101`) for a co-located scraper/agent, or a
@@ -65,6 +67,7 @@ pub struct Internal {
 	stats: moq_net::stats::Registry,
 	nodes: Option<crate::nodes::Nodes>,
 	control_sessions: ControlSessionRegistry,
+	data_sessions: ControlSessionRegistry,
 }
 
 #[derive(Clone)]
@@ -72,6 +75,7 @@ struct InternalState {
 	stats: moq_net::stats::Registry,
 	nodes: Option<crate::nodes::Nodes>,
 	control_sessions: ControlSessionRegistry,
+	data_sessions: ControlSessionRegistry,
 }
 
 impl Internal {
@@ -82,6 +86,7 @@ impl Internal {
 			stats,
 			nodes: None,
 			control_sessions: ControlSessionRegistry::default(),
+			data_sessions: ControlSessionRegistry::default(),
 		}
 	}
 
@@ -89,11 +94,12 @@ impl Internal {
 	pub fn with_cluster(mut self, cluster: &crate::Cluster) -> Self {
 		self.nodes = Some(cluster.nodes.clone());
 		self.control_sessions = cluster.control_sessions.clone();
+		self.data_sessions = cluster.data_sessions.clone();
 		self
 	}
 
-	/// Build the ops router (`/metrics`, `/health`, `/nodes`, and
-	/// `/cluster/control-sessions`).
+	/// Build the ops router (`/metrics`, `/health`, `/nodes`,
+	/// `/cluster/control-sessions`, and `/cluster/data-sessions`).
 	///
 	/// Exposed so embedders can mount it on their own listener.
 	pub fn routes(&self) -> Router {
@@ -102,10 +108,12 @@ impl Internal {
 			.route("/health", get(serve_health))
 			.route("/nodes", get(serve_nodes))
 			.route("/cluster/control-sessions", get(serve_control_sessions))
+			.route("/cluster/data-sessions", get(serve_data_sessions))
 			.with_state(InternalState {
 				stats: self.stats.clone(),
 				nodes: self.nodes.clone(),
 				control_sessions: self.control_sessions.clone(),
+				data_sessions: self.data_sessions.clone(),
 			})
 	}
 
@@ -164,6 +172,11 @@ async fn serve_nodes(State(state): State<InternalState>) -> Json<crate::nodes::S
 /// Structured, connection-scoped telemetry for inbound and outbound control-only sessions.
 async fn serve_control_sessions(State(state): State<InternalState>) -> Json<ControlSessionTelemetry> {
 	Json(state.control_sessions.snapshot())
+}
+
+/// Structured, connection-scoped telemetry for explicitly measured data sessions.
+async fn serve_data_sessions(State(state): State<InternalState>) -> Json<ControlSessionTelemetry> {
+	Json(state.data_sessions.snapshot())
 }
 
 /// Render a [`moq_net::stats::Snapshot`] as Prometheus text exposition (v0.0.4).
@@ -281,6 +294,7 @@ mod tests {
 			stats: moq_net::stats::Registry::disabled(),
 			nodes: None,
 			control_sessions: ControlSessionRegistry::default(),
+			data_sessions: ControlSessionRegistry::default(),
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
@@ -296,6 +310,7 @@ mod tests {
 			stats: moq_net::stats::Registry::disabled(),
 			nodes: Some(nodes),
 			control_sessions: ControlSessionRegistry::default(),
+			data_sessions: ControlSessionRegistry::default(),
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
@@ -316,12 +331,37 @@ mod tests {
 			stats: moq_net::stats::Registry::disabled(),
 			nodes: None,
 			control_sessions,
+			data_sessions: ControlSessionRegistry::default(),
 		};
 
 		let Json(payload) = serve_control_sessions(State(state)).await;
 		let value = serde_json::to_value(payload).expect("serialize control telemetry");
 		assert_eq!(value["schema_version"], 4);
 		assert_eq!(value["sessions"][0]["kind"], "control_only");
+		assert_eq!(value["sessions"][0]["state"], "connecting");
+	}
+
+	#[tokio::test]
+	async fn data_session_endpoint_is_separate_from_control_artifact() {
+		let data_sessions = ControlSessionRegistry::default();
+		let _handle = data_sessions.begin_data(
+			8,
+			crate::control_telemetry::Direction::Inbound,
+			"transport:quic".to_string(),
+			None,
+			moq_net::stats::Registry::new(Default::default()),
+		);
+		let state = InternalState {
+			stats: moq_net::stats::Registry::disabled(),
+			nodes: None,
+			control_sessions: ControlSessionRegistry::default(),
+			data_sessions,
+		};
+
+		let Json(payload) = serve_data_sessions(State(state)).await;
+		let value = serde_json::to_value(payload).expect("serialize data telemetry");
+		assert_eq!(value["schema_version"], 4);
+		assert_eq!(value["sessions"][0]["kind"], "data");
 		assert_eq!(value["sessions"][0]["state"], "connecting");
 	}
 
