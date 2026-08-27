@@ -356,6 +356,16 @@ impl<S: web_transport_trait::Session> Request<S> {
 		self.origin
 	}
 
+	/// Assign a cluster transport hint for a peer whose negotiated protocol has no
+	/// origin field (for example, an IETF raw cluster session). A protocol-declared
+	/// origin, when present, remains authoritative.
+	pub fn with_assigned_peer_origin(mut self, origin: crate::Origin) -> Self {
+		if self.origin.is_none() {
+			self.origin = Some(origin);
+		}
+		self
+	}
+
 	/// Publish to the connected client. Overrides any value from the [`Server`]
 	/// builder; typically set after inspecting [`path`](Self::path).
 	pub fn with_publisher(mut self, publish: impl Consume<origin::Consumer>) -> Self {
@@ -402,6 +412,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 	/// Accept the session, returning the [`Session`] and the [`Driver`] that runs
 	/// its protocol work.
 	pub async fn ok(mut self) -> Result<(Session, Driver), Error> {
+		let peer_origin = self.origin;
 		let RequestInner { server, handshake } = self.inner.take().expect("request already responded");
 
 		// Tag the origin pair with the stats context so the model attributes reads
@@ -409,6 +420,12 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 		// both halves keeps presence and viewer counts from double-attributing.
 		let publish = server.publish.map(|origin| origin.with_stats(server.stats.clone()));
 		let subscribe = server.subscribe.map(|origin| origin.with_stats(server.stats.clone()));
+		// IETF transports carry no hop identity. Apply the assigned peer hint to the
+		// egress consumer so broadcasts sourced by that peer are not echoed back.
+		let publish = match peer_origin {
+			Some(peer) => publish.map(|origin| origin.excluding(peer)),
+			None => publish,
+		};
 
 		let (session, mut stream, version, request_id_max) = match handshake {
 			Handshake::IetfModern {
@@ -425,7 +442,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 					false,
 					publish,
 					subscribe,
-					None,
+					peer_origin,
 					version,
 					None,
 					Some(peer_setup),
@@ -445,7 +462,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 					None,
 					publish,
 					subscribe,
-					None,
+					peer_origin,
 					version,
 					lite::Setup::default(),
 					None,
@@ -478,7 +495,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 					None,
 					publish,
 					subscribe,
-					None,
+					peer_origin,
 					version,
 					our_setup,
 					Some(client_setup),
@@ -529,7 +546,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 					Some(stream),
 					publish,
 					subscribe,
-					None,
+					peer_origin,
 					v,
 					lite::Setup::default(),
 					None,
@@ -546,7 +563,7 @@ impl<S: web_transport_trait::Session> Request<MeteredSession<S>> {
 					false,
 					publish,
 					subscribe,
-					None,
+					peer_origin,
 					v,
 					None,
 					None,
@@ -949,5 +966,23 @@ mod tests {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, Some(origin))]);
 		let request = Server::new().accept_request(session).await.unwrap();
 		assert_eq!(request.peer_origin(), Some(origin));
+		assert_eq!(
+			request
+				.with_assigned_peer_origin(Origin::new(43).unwrap())
+				.peer_origin(),
+			Some(origin)
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn assigned_peer_origin_fills_ietf_request() {
+		let assigned = Origin::new(43).unwrap();
+		let session = FakeSession::new(ALPN_19, [ietf_setup(ietf::Version::Draft19, Some("/cluster"))]);
+		let request = Server::new().accept_request(session).await.unwrap();
+		assert_eq!(request.peer_origin(), None);
+		assert_eq!(
+			request.with_assigned_peer_origin(assigned).peer_origin(),
+			Some(assigned)
+		);
 	}
 }

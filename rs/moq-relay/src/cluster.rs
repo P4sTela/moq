@@ -267,6 +267,13 @@ pub struct ClusterConfig {
 	/// something large for a metered backbone; an unpriced link costs 1, which
 	/// reproduces plain hop counting. The param is consumed by this relay, not
 	/// sent to the peer.
+	///
+	/// For raw IETF cluster links, add `?cluster_peer_origin=<id>` to assign the
+	/// expected remote `cluster-id` on the dialing side. The relay automatically
+	/// carries its own `cluster-id` as a `cluster_origin` marker in the request
+	/// target so the peer can apply the reciprocal filter. The peer must authenticate
+	/// with a cluster-capable JWT (`cluster=true`) or mTLS; public clients cannot use
+	/// the marker.
 	#[serde(alias = "connect")]
 	#[arg(
 		id = "cluster-connect",
@@ -373,6 +380,15 @@ pub struct ClusterConfig {
 	/// `room/<run-id>/area/area-north-west`.
 	#[arg(id = "cluster-namespace", long = "cluster-namespace", env = "MOQ_CLUSTER_NAMESPACE")]
 	pub namespace: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteSessionOptions<'a> {
+	cost: Option<u64>,
+	remote_namespace: Option<&'a str>,
+	peer_origin: Option<Origin>,
+	control_only: bool,
+	protocol_bytes: bool,
 }
 
 /// A relay cluster built around a single [`origin::Producer`].
@@ -1016,6 +1032,15 @@ impl Cluster {
 		// control-only observation dials, preserve both markers on the transport URL
 		// so the inbound relay can classify and enforce the same policy.
 		let remote_namespace = take_namespace(&mut url)?;
+		// IETF transport has no on-wire hop identity. This local marker identifies
+		// the remote relay for the client-side split-horizon filter; the dialer's own
+		// origin is appended below and remains in the request target for the server.
+		let peer_origin = take_origin(&mut url, control_telemetry::CLUSTER_PEER_ORIGIN_QUERY)?;
+		// The relay's own id is authoritative for this dial; replace any stale
+		// marker that may have arrived through a discovered URL.
+		let _ = take_origin(&mut url, control_telemetry::CLUSTER_ORIGIN_QUERY)?;
+		url.query_pairs_mut()
+			.append_pair(control_telemetry::CLUSTER_ORIGIN_QUERY, &self.origin.id().to_string());
 		if control_only {
 			anyhow::ensure!(
 				self.namespace_filter_enabled(),
@@ -1054,13 +1079,18 @@ impl Cluster {
 		// turn into a tight reconnect loop.
 		let stable_threshold = tokio::time::Duration::from_secs(10);
 
+		let options = RemoteSessionOptions {
+			cost,
+			remote_namespace: remote_namespace.as_deref(),
+			peer_origin,
+			control_only,
+			protocol_bytes,
+		};
 		let mut backoff = base_backoff;
 
 		loop {
 			let started = tokio::time::Instant::now();
-			let result = self
-				.run_remote_once(&url, cost, remote_namespace.as_deref(), control_only, protocol_bytes)
-				.await;
+			let result = self.run_remote_once(&url, options).await;
 			let elapsed = started.elapsed();
 
 			match result {
@@ -1079,31 +1109,23 @@ impl Cluster {
 		}
 	}
 
-	async fn run_remote_once(
-		&self,
-		url: &Url,
-		cost: Option<u64>,
-		remote_namespace: Option<&str>,
-		control_only: bool,
-		protocol_bytes: bool,
-	) -> anyhow::Result<()> {
+	async fn run_remote_once(&self, url: &Url, options: RemoteSessionOptions<'_>) -> anyhow::Result<()> {
 		// Each attempt is its own session, so it gets its own id. Matches the span an
 		// accepted connection runs under, so both directions log the same way.
 		let id = self.next_connection_id();
-		self.run_remote_session(id, url, cost, remote_namespace, control_only, protocol_bytes)
+		self.run_remote_session(id, url, options)
 			.instrument(tracing::info_span!("conn", id))
 			.await
 	}
 
-	async fn run_remote_session(
-		&self,
-		id: u64,
-		url: &Url,
-		cost: Option<u64>,
-		remote_namespace: Option<&str>,
-		control_only: bool,
-		protocol_bytes: bool,
-	) -> anyhow::Result<()> {
+	async fn run_remote_session(&self, id: u64, url: &Url, options: RemoteSessionOptions<'_>) -> anyhow::Result<()> {
+		let RemoteSessionOptions {
+			cost,
+			remote_namespace,
+			peer_origin,
+			control_only,
+			protocol_bytes,
+		} = options;
 		let mut log_url = url.clone();
 		log_url.set_query(None);
 		tracing::info!(url = %log_url, "dialing cluster peer");
@@ -1153,6 +1175,10 @@ impl Cluster {
 		} else {
 			client.with_stats(self.stats.tier(self.cluster_tier()).session(""))
 		};
+		if let Some(peer_origin) = peer_origin {
+			tracing::info!(peer_origin = %peer_origin.id(), "assigned cluster peer origin");
+			client = client.with_peer_origin(peer_origin);
+		}
 		if !control_only {
 			if self.namespace_filter_enabled() {
 				let local_namespace = self
@@ -1328,6 +1354,35 @@ fn take_namespace(url: &mut Url) -> anyhow::Result<Option<String>> {
 	Ok(Some(value))
 }
 
+/// Extract and remove a local-only expected peer-origin marker from a peer URL.
+fn take_origin(url: &mut Url, key: &str) -> anyhow::Result<Option<Origin>> {
+	let Some(value) = url
+		.query_pairs()
+		.find_map(|(query_key, value)| (query_key == key).then(|| value.into_owned()))
+	else {
+		return Ok(None);
+	};
+	let id = value
+		.parse::<u64>()
+		.with_context(|| format!("cluster peer origin {key} must be an unsigned integer, got {value:?}"))?;
+	let origin = Origin::new(id).map_err(|_| anyhow::anyhow!("cluster peer origin {key} is out of range: {id}"))?;
+
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(query_key, _)| query_key != key)
+		.map(|(query_key, value)| (query_key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (query_key, value) in &remaining {
+			pairs.append_pair(query_key, value);
+		}
+	}
+
+	Ok(Some(origin))
+}
+
 /// Whether a `--cluster-connect-api` source is an http(s) URL (otherwise it's
 /// treated as a local file path, which needs no TLS client).
 fn connect_api_is_http(source: &str) -> bool {
@@ -1482,6 +1537,18 @@ mod tests {
 		let mut url = Url::parse("https://peer.example/").unwrap();
 		assert_eq!(take_namespace(&mut url).unwrap(), None);
 		assert_eq!(url.as_str(), "https://peer.example/");
+	}
+
+	#[test]
+	fn peer_origin_param_is_consumed_and_validated() {
+		let mut url = Url::parse("https://peer.example/?jwt=abc&cluster_peer_origin=42&namespace=remote").unwrap();
+		assert_eq!(take_origin(&mut url, "cluster_peer_origin").unwrap().unwrap().id(), 42);
+		assert_eq!(url.as_str(), "https://peer.example/?jwt=abc&namespace=remote");
+
+		for value in ["0", "4611686018427387904", "not-a-number"] {
+			let mut url = Url::parse(&format!("https://peer.example/?cluster_peer_origin={value}")).unwrap();
+			assert!(take_origin(&mut url, "cluster_peer_origin").is_err(), "{value}");
+		}
 	}
 
 	#[test]

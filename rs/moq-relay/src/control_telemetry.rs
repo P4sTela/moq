@@ -19,6 +19,14 @@ use serde::Serialize;
 pub(crate) const CONTROL_ONLY_QUERY: &str = "control_only";
 pub(crate) const PROTOCOL_BYTES_QUERY: &str = "protocol_bytes";
 pub(crate) const NAMESPACE_QUERY: &str = "namespace";
+// Raw IETF cluster sessions have no on-wire hop identity. The dialer carries
+// its own identity in SETUP so the server can apply the same split-horizon
+// exclusion that moq-lite peers get from their setup origin.
+pub(crate) const CLUSTER_ORIGIN_QUERY: &str = "cluster_origin";
+// This marker is local dial configuration: it identifies the remote relay whose
+// origin should be assigned to the client-side session, then is consumed before
+// the URL reaches the transport.
+pub(crate) const CLUSTER_PEER_ORIGIN_QUERY: &str = "cluster_peer_origin";
 
 const SCHEMA_VERSION: u32 = 4;
 const MAX_COMPLETED: usize = 32;

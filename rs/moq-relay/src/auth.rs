@@ -608,6 +608,22 @@ impl AuthConfig {
 	}
 }
 
+#[derive(Default, serde::Deserialize)]
+struct JwtMetadata {
+	#[serde(default)]
+	cluster: bool,
+}
+
+/// Return the authenticated JWT's cluster capability after its signature has
+/// already been verified by the normal key resolver. This separate metadata
+/// decode keeps the public moq-token Claims shape stable while preserving the
+/// legacy `cluster` claim used by relay peer credentials.
+fn jwt_is_cluster(token: &str) -> bool {
+	jsonwebtoken::dangerous::insecure_decode::<JwtMetadata>(token)
+		.map(|data| data.claims.cluster)
+		.unwrap_or(false)
+}
+
 /// The result of a successful authentication, containing the resolved
 /// permissions for a connection.
 ///
@@ -628,6 +644,9 @@ pub struct AuthToken {
 	/// through configuration or the auth API's `tier` field; defaults to the
 	/// unprefixed tier.
 	pub tier: Tier,
+	/// Whether the authenticated credential is allowed to carry relay cluster
+	/// origin markers. Public access never grants this capability.
+	pub cluster: bool,
 	/// When the credential backing this session expires, if it has an expiry.
 	///
 	/// For JWT auth this is the token's `exp` claim; for mTLS it's the peer
@@ -657,6 +676,7 @@ impl AuthToken {
 			tier: Tier::default(),
 			// Filled in by the caller from the peer certificate's notAfter.
 			expires: None,
+			cluster: true,
 		}
 	}
 }
@@ -1050,6 +1070,7 @@ impl Auth {
 		// pid); anchor the resulting scope on the alias (canonical pid).
 		let mut token = Self::finalize(&params.path, &alias, claims)?;
 		token.tier = tier;
+		token.cluster = params.jwt.as_deref().is_some_and(jwt_is_cluster);
 		Ok(token)
 	}
 
@@ -1108,7 +1129,9 @@ impl Auth {
 			return Err(AuthError::ExpectedToken);
 		};
 
-		Self::finalize(&params.path, &params.path, claims)
+		let mut token = Self::finalize(&params.path, &params.path, claims)?;
+		token.cluster = params.jwt.as_deref().is_some_and(jwt_is_cluster);
+		Ok(token)
 	}
 
 	/// Reduce verified `claims` into an [`AuthToken`].
@@ -1151,6 +1174,7 @@ impl Auth {
 			subscribe: rebase(permissions.subscribe),
 			publish: rebase(permissions.publish),
 			tier: Tier::default(),
+			cluster: false,
 			expires: claims.expires,
 		})
 	}
@@ -1165,6 +1189,26 @@ mod tests {
 	use super::*;
 	use moq_token::{Algorithm, Key, KeyId};
 	use tempfile::TempDir;
+
+	#[test]
+	fn cluster_metadata_is_read_only_from_a_verified_jwt_payload() {
+		let signing_key = jsonwebtoken::EncodingKey::from_secret(b"test cluster marker secret");
+		let cluster = jsonwebtoken::encode(
+			&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+			&serde_json::json!({"cluster": true}),
+			&signing_key,
+		)
+		.unwrap();
+		let ordinary = jsonwebtoken::encode(
+			&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+			&serde_json::json!({"cluster": false}),
+			&signing_key,
+		)
+		.unwrap();
+		assert!(jwt_is_cluster(&cluster));
+		assert!(!jwt_is_cluster(&ordinary));
+		assert!(!jwt_is_cluster("not-a-jwt"));
+	}
 
 	#[test]
 	fn auth_params_from_path() {
@@ -1334,6 +1378,7 @@ mod tests {
 		assert_eq!(token.root, "room/123".as_path());
 		assert_eq!(token.subscribe, vec!["".as_path()]);
 		assert_eq!(token.publish, vec!["alice".as_path()]);
+		assert!(!token.cluster);
 
 		Ok(())
 	}

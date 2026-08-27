@@ -22,6 +22,15 @@ impl From<AuthError> for StatusError {
 	}
 }
 
+fn parse_cluster_origin(value: Option<String>) -> anyhow::Result<Option<moq_net::Origin>> {
+	let Some(value) = value else { return Ok(None) };
+	let id = value
+		.parse::<u64>()
+		.map_err(|error| anyhow::anyhow!("invalid cluster origin {value:?}: {error}"))?;
+	let origin = moq_net::Origin::new(id).map_err(|_| anyhow::anyhow!("cluster origin is out of range: {id}"))?;
+	Ok(Some(origin))
+}
+
 /// An incoming connection that has not yet been authenticated.
 ///
 /// Call [`run`](Self::run) to authenticate the request, wire up
@@ -47,7 +56,6 @@ impl Connection {
 	}
 
 	async fn run_inner(self) -> anyhow::Result<()> {
-		let peer_origin = self.request.peer_origin();
 		let transport = self.request.transport();
 		// URL-less transports must carry an explicit request target in SETUP. Without
 		// one, Lite01-04 (which have no SETUP path) and pathless modern sessions would
@@ -89,6 +97,20 @@ impl Connection {
 				None,
 			),
 		};
+		let cluster_origin_value = match self.request.url() {
+			Some(url) => crate::control_telemetry::query_value(url, crate::control_telemetry::CLUSTER_ORIGIN_QUERY),
+			None => crate::control_telemetry::query_value_in_path(
+				self.request.path(),
+				crate::control_telemetry::CLUSTER_ORIGIN_QUERY,
+			),
+		};
+		let cluster_origin = match parse_cluster_origin(cluster_origin_value) {
+			Ok(origin) => origin,
+			Err(error) => {
+				let _ = self.request.close(http::StatusCode::BAD_REQUEST.as_u16()).await;
+				return Err(error);
+			}
+		};
 		let token = match self.authenticate().await {
 			Ok(token) => token,
 			Err(err) => {
@@ -96,6 +118,10 @@ impl Connection {
 				return Err(err.source);
 			}
 		};
+		if cluster_origin.is_some() && !token.cluster {
+			let _ = self.request.close(http::StatusCode::FORBIDDEN.as_u16()).await;
+			anyhow::bail!("cluster origin marker requires a cluster credential");
+		}
 
 		let publish = self.cluster.publisher(&token);
 		let subscribe = self.cluster.subscriber(&token);
@@ -235,6 +261,10 @@ impl Connection {
 		// publish-only or subscribe-only session. Control-only sessions intentionally
 		// leave both sides unset.
 		let mut request = self.request.with_stats(stats);
+		if let Some(cluster_origin) = cluster_origin {
+			request = request.with_assigned_peer_origin(cluster_origin);
+		}
+		let peer_origin = request.peer_origin();
 		if !control_only {
 			if let Some(subscribe) = subscribe {
 				request = request.with_publisher(&subscribe);

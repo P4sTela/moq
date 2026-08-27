@@ -1023,6 +1023,25 @@ impl Request {
 		}
 	}
 
+	/// Assign a cluster transport hint for a peer whose negotiated protocol has no
+	/// origin field, such as an IETF raw cluster session. A protocol-declared origin
+	/// remains authoritative.
+	pub fn with_assigned_peer_origin(self, origin: moq_net::Origin) -> Self {
+		let Request {
+			transport,
+			url,
+			identity,
+			kind,
+		} = self;
+		let kind = request_map!(kind, request => request.with_assigned_peer_origin(origin));
+		Request {
+			transport,
+			url,
+			identity,
+			kind,
+		}
+	}
+
 	/// Attach a per-connection [`moq_net::stats::Session`] context to this session.
 	pub fn with_stats(self, stats: moq_net::stats::Session) -> Self {
 		let Request {
