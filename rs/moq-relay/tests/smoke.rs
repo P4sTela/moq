@@ -14,7 +14,7 @@ use std::{
 };
 
 use moq_native::moq_net::{self, Origin};
-use moq_relay::{AuthConfig, Cluster, ClusterConfig, Connection, PublicConfig, Web, WebConfig};
+use moq_relay::{AuthConfig, CacheConfig, Cluster, ClusterConfig, Connection, PublicConfig, Web, WebConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -34,6 +34,14 @@ fn newest_lite_version() -> moq_net::Version {
 }
 
 async fn build_web(port: u16, ws: bool) -> Web {
+	build_web_with_cache(port, ws, None).await
+}
+
+/// Build the test relay with the production cache wiring when requested.
+/// `None` preserves the default unbounded pool used by the existing smoke tests;
+/// `Some(duration)` additionally installs the relay's cache-duration ceiling and
+/// a finite byte budget for the Phase 5 late-join cases.
+async fn build_web_with_cache(port: u16, ws: bool, cache_duration: Option<Duration>) -> Web {
 	// Crypto provider is process-global; reinstalls after the first one are
 	// no-ops, but the test binary may run before any other moq code does.
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -50,7 +58,17 @@ async fn build_web(port: u16, ws: bool) -> Web {
 		.await
 		.expect("auth init");
 
-	let cluster = Cluster::new(ClusterConfig::default()).expect("cluster init");
+	let mut cluster_config = ClusterConfig::default();
+	// Keep an abruptly disconnected source announced long enough for a
+	// late-joiner to exercise the retained relay track.
+	cluster_config.linger = Some(Duration::from_secs(5));
+	let mut cluster = Cluster::new(cluster_config).expect("cluster init");
+	if let Some(duration) = cache_duration {
+		let mut cache_config = CacheConfig::default();
+		cache_config.capacity = Some("64MiB".into());
+		cache_config.duration = Some(duration);
+		cluster = cluster.with_cache(cache_config.init().expect("cache init"));
+	}
 
 	// moq_native::Server is needed for `certificates`, even though we never
 	// expose HTTPS or QUIC in this test. Binding QUIC to `[::]:0` picks an
@@ -105,8 +123,12 @@ async fn wait_for_http(port: u16, server_result: &mut tokio::sync::oneshot::Rece
 /// with fully public auth, and return the port plus an abort handle for the
 /// spawned web server.
 async fn spawn_relay() -> (u16, tokio::task::JoinHandle<()>) {
+	spawn_relay_with_cache(None).await
+}
+
+async fn spawn_relay_with_cache(cache_duration: Option<Duration>) -> (u16, tokio::task::JoinHandle<()>) {
 	let port = free_tcp_port();
-	let web = build_web(port, true).await;
+	let web = build_web_with_cache(port, true, cache_duration).await;
 
 	let (server_result_tx, mut server_result_rx) = tokio::sync::oneshot::channel();
 	let handle = tokio::spawn(async move {
@@ -136,6 +158,164 @@ fn client_version(version: Option<moq_net::Version>) -> moq_native::Client {
 		config.version = vec![version];
 	}
 	config.init().expect("client init")
+}
+
+/// A canonical cache/late-join canary. The early subscriber forces the relay to
+/// materialize both state groups, and the late subscriber starts at the live edge
+/// before fetching the older retained group while the publisher remains connected.
+/// Publisher-disconnect persistence is intentionally not asserted here: the
+/// canonical relay releases an aborted source track when its lingered broadcast
+/// eventually closes, which is a separate future-work contract.
+#[tokio::test]
+async fn relay_websocket_late_join_replays_retained_history_while_source_alive() {
+	let (port, web_handle) = spawn_relay_with_cache(Some(Duration::from_secs(5))).await;
+	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
+
+	// Publish an overwrite-style current-state track with two complete groups.
+	let pub_origin = Origin::random().produce();
+	let mut broadcast = pub_origin
+		.create_broadcast("late-join", moq_net::broadcast::Route::new().with_announce(true))
+		.expect("create broadcast");
+	let track_info = moq_net::track::Info::default().with_latency_max(Duration::from_secs(30));
+	let mut track = broadcast
+		.create_track("state", Some(track_info))
+		.expect("create state track");
+	let mut old_group = track.append_group().expect("append old group");
+	old_group
+		.write_frame(moq_net::Timestamp::ZERO, b"state-0".as_ref())
+		.expect("write old state");
+	old_group.finish().expect("finish old state");
+
+	let pub_session = tokio::time::timeout(TIMEOUT, client().with_publisher(&pub_origin).connect(url.clone()))
+		.await
+		.expect("publisher connect timeout")
+		.expect("publisher connect failed");
+
+	// The early subscriber requests from sequence zero so group 0 is definitely
+	// present in the relay cache before the late-join phase begins.
+	let early_origin = Origin::random().produce();
+	let mut early_announcements = early_origin.consume().announced();
+	let early_session = tokio::time::timeout(
+		TIMEOUT,
+		client().with_subscriber(early_origin).connect(url.clone()),
+	)
+	.await
+	.expect("early subscriber connect timeout")
+	.expect("early subscriber connect failed");
+	let moq_net::announce::Update {
+		path: early_path,
+		broadcast: early_broadcast,
+	} = tokio::time::timeout(TIMEOUT, early_announcements.next())
+		.await
+		.expect("early announcement timeout")
+		.expect("early origin closed");
+	assert_eq!(early_path.as_str(), "late-join");
+	let early_broadcast = early_broadcast.expect("expected early announce");
+	let early_track = early_broadcast.track("state").expect("early state track");
+	let mut early_sub = early_track
+		.subscribe(Some(
+			moq_net::track::Subscription::default()
+				.with_group_start(0)
+				.with_latency_max(Duration::from_secs(30)),
+		))
+		.await
+		.expect("early state subscribe");
+	let mut early_group = tokio::time::timeout(TIMEOUT, early_sub.recv_group())
+		.await
+		.expect("early group timeout")
+		.expect("early group receive failed")
+		.expect("early track closed");
+	assert_eq!(early_group.sequence, 0);
+	let early_frame = tokio::time::timeout(TIMEOUT, early_group.read_frame())
+		.await
+		.expect("early frame timeout")
+		.expect("early frame receive failed")
+		.expect("early group closed");
+	assert_eq!(&early_frame.payload[..], b"state-0");
+
+	// A second group establishes a live edge while retaining group 0.
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	let mut current_group = track.append_group().expect("append current group");
+	current_group
+		.write_frame(moq_net::Timestamp::from_millis(100).unwrap(), b"state-1".as_ref())
+		.expect("write current state");
+	current_group.finish().expect("finish current state");
+	let mut early_current = tokio::time::timeout(TIMEOUT, early_sub.recv_group())
+		.await
+		.expect("early current group timeout")
+		.expect("early current group receive failed")
+		.expect("early track closed at current state");
+	assert_eq!(early_current.sequence, 1);
+	let early_current_frame = tokio::time::timeout(TIMEOUT, early_current.read_frame())
+		.await
+		.expect("early current frame timeout")
+		.expect("early current frame receive failed")
+		.expect("early current group closed");
+	assert_eq!(&early_current_frame.payload[..], b"state-1");
+	drop(early_sub);
+	drop(early_session);
+
+	// The late subscriber joins at the current state while the source is alive.
+	let late_origin = Origin::random().produce();
+	let mut late_announcements = late_origin.consume().announced();
+	let late_session = tokio::time::timeout(
+		TIMEOUT,
+		client().with_subscriber(late_origin).connect(url),
+	)
+	.await
+	.expect("late subscriber connect timeout")
+	.expect("late subscriber connect failed");
+	let moq_net::announce::Update {
+		path: late_path,
+		broadcast: late_broadcast,
+	} = tokio::time::timeout(TIMEOUT, late_announcements.next())
+		.await
+		.expect("late announcement timeout")
+		.expect("late origin closed");
+	assert_eq!(late_path.as_str(), "late-join");
+	let late_broadcast = late_broadcast.expect("expected late announce");
+	let late_track = late_broadcast.track("state").expect("late state track");
+	let subscribe_started = std::time::Instant::now();
+	let mut late_sub = late_track.clone().subscribe(None).await.expect("late state subscribe");
+	let mut late_group = tokio::time::timeout(TIMEOUT, late_sub.recv_group())
+		.await
+		.expect("late current group timeout")
+		.expect("late current group receive failed")
+		.expect("late track closed");
+	let late_ttfs_ms = subscribe_started.elapsed().as_secs_f64() * 1000.0;
+	assert_eq!(late_group.sequence, 1);
+	let late_frame = tokio::time::timeout(TIMEOUT, late_group.read_frame())
+		.await
+		.expect("late current frame timeout")
+		.expect("late current frame receive failed")
+		.expect("late current group closed");
+	assert_eq!(&late_frame.payload[..], b"state-1");
+
+	// Fetch the older group while the upstream source is still connected. This
+	// exercises the canonical retained-group path without conflating it with
+	// publisher-disconnect persistence, which is not guaranteed by `cluster.linger`.
+	let fetch_started = std::time::Instant::now();
+	let mut historical = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None))
+		.await
+		.expect("historical fetch timeout")
+		.expect("historical fetch failed while source is alive");
+	let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
+	let historical_frame = tokio::time::timeout(TIMEOUT, historical.read_frame())
+		.await
+		.expect("historical frame timeout")
+		.expect("historical frame receive failed")
+		.expect("historical group closed");
+	assert_eq!(&historical_frame.payload[..], b"state-0");
+	eprintln!(
+		"phase5_late_join cache_duration=5s current_sequence=1 history_sequence=0 ttfs_ms={late_ttfs_ms:.3} history_ttfs_ms={history_ttfs_ms:.3} source_alive=true"
+	);
+
+	drop(late_sub);
+	drop(late_session);
+	drop(pub_session);
+	drop(track);
+	drop(broadcast);
+	web_handle.abort();
 }
 
 /// Connect a publisher and a subscriber to a real relay over `ws://`, push
