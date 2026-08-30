@@ -3253,13 +3253,41 @@ mod tests {
 		assert_eq!(ingress.frames, 2);
 		assert_eq!(ingress.bytes, 10);
 
-		// A fetch bumps only `fetches` on the egress side, plus the delivered group.
-		let fetched = broadcast.track("video").unwrap().fetch_group(0, None).await.unwrap();
-		let _ = fetched;
+		// A local cache hit is followed by a dynamic backfill. Outcome counters are
+		// recorded at terminal poll time, while the legacy request counter remains
+		// one increment per caller.
+		let fetch_track = broadcast.track("video").unwrap();
+		let local = fetch_track.fetch_group(0, None);
+		assert!(kio::Pollable::poll(&*local, &kio::Waiter::noop()).is_ready());
+		assert!(kio::Pollable::poll(&*local, &kio::Waiter::noop()).is_ready());
+		let _ = local.await.unwrap();
+
+		let track_dynamic = producer.dynamic();
+		let backfill = fetch_track.fetch_group(5, None);
+		assert!(kio::Pollable::poll(&*backfill, &kio::Waiter::noop()).is_pending());
+		let request = track_dynamic.requested_group().await.unwrap();
+		let mut backfill_group = request.accept(None).unwrap();
+		backfill_group
+			.write_frame(Timestamp::ZERO, Bytes::from_static(b"backfill"))
+			.unwrap();
+		backfill_group.finish().unwrap();
+		assert!(kio::Pollable::poll(&*backfill, &kio::Waiter::noop()).is_ready());
+		assert!(kio::Pollable::poll(&*backfill, &kio::Waiter::noop()).is_ready());
+		let _ = backfill.await.unwrap();
+		drop(track_dynamic);
+
 		settle().await;
 		let report = registry.report();
 		let entry = report.traffic.iter().find(|e| e.path.as_str() == "demo").unwrap();
-		assert_eq!(entry.publisher.fetches, 1, "one fetch");
+		assert_eq!(entry.publisher.fetches, 2, "one request per fetch caller");
+		assert_eq!(
+			(
+				entry.publisher.fetches_local,
+				entry.publisher.fetches_dynamic,
+				entry.publisher.fetches_miss
+			),
+			(1, 1, 0)
+		);
 		assert_eq!(entry.publisher.subscriptions, 1, "fetch does not bump subscriptions");
 		assert_eq!(entry.publisher.broadcasts, 1, "fetch does not bump the viewer refcount");
 		// `fetches` is egress-only for the same structural reason as `broadcasts`:

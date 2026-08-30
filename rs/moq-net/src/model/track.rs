@@ -251,11 +251,12 @@ struct PendingFetch {
 	result: kio::Producer<FetchOutcome>,
 }
 
-/// The result of a fetch attempt. Stays empty on success (the group lands in the
-/// track cache); a handler writes `rejected` to fail every joined fetch.
+/// The result of a fetch attempt. A successful dynamic handler marks the attempt
+/// before removing it, so every joined fetch can distinguish it from a local hit.
 #[derive(Default)]
 struct FetchOutcome {
 	rejected: Option<Error>,
+	accepted_by_dynamic: bool,
 }
 
 impl TrackState {
@@ -1759,6 +1760,7 @@ impl Consumer {
 				return kio::Pending::new(Fetching {
 					inner: FetchingKind::Spliced(resume.fetch_group(sequence, options)),
 					stats: self.stats.clone(),
+					resolution: OnceLock::new(),
 				});
 			}
 		};
@@ -1804,6 +1806,7 @@ impl Consumer {
 				result,
 			},
 			stats: self.stats.clone(),
+			resolution: OnceLock::new(),
 		})
 	}
 
@@ -2007,6 +2010,11 @@ impl GroupRequest {
 		// would read as NotFound).
 		let res = TrackState::modify(&self.state)
 			.and_then(|mut state| state.insert_group_request(self.sequence, info.into()));
+		if res.is_ok()
+			&& let Ok(mut outcome) = self.result.write()
+		{
+			outcome.accepted_by_dynamic = true;
+		}
 		self.remove();
 		res
 	}
@@ -2048,11 +2056,28 @@ impl Drop for GroupRequest {
 /// Awaited via the [`kio::Pending`] wrapper; resolves to the
 /// [`group::Consumer`] once the group lands in the track's cache (already present,
 /// or produced after a wire FETCH), or [`Error::NotFound`] if it can never exist.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FetchResolution {
+	Local,
+	Dynamic,
+	Miss,
+}
+
+enum FetchAttempt {
+	Dynamic,
+	Rejected(Error),
+}
+
+/// The pollable state of a [`Consumer::fetch_group`], resolving to a cached or
+/// dynamically fetched group (or a terminal error).
 pub struct Fetching {
 	inner: FetchingKind,
 	// Egress stats scope, so the resolved group carries a payload meter (and counts
 	// as one delivered group). Empty (no-op) for an untagged track.
 	stats: stats::Scope,
+	// A kio future may be polled again after it becomes ready. Record the terminal
+	// classification once so coalesced/duplicate polls do not inflate counters.
+	resolution: OnceLock<FetchResolution>,
 }
 
 enum FetchingKind {
@@ -2071,6 +2096,23 @@ impl kio::Pollable for Fetching {
 	type Output = Result<group::Consumer>;
 
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
+		self.poll_classified(waiter).map(|result| match result {
+			Ok((group, resolution)) => {
+				self.record_resolution(resolution);
+				Ok(group.with_meter(self.stats.meter()))
+			}
+			Err(err) => {
+				self.record_resolution(FetchResolution::Miss);
+				Err(err)
+			}
+		})
+	}
+}
+
+impl Fetching {
+	/// Poll without recording stats, so a spliced/resume consumer can propagate the
+	/// source classification to its outer session scope without double counting.
+	pub(crate) fn poll_classified(&self, waiter: &kio::Waiter) -> Poll<Result<(group::Consumer, FetchResolution)>> {
 		let (state, fetch, sequence, result) = match &self.inner {
 			FetchingKind::Plain {
 				state,
@@ -2079,17 +2121,48 @@ impl kio::Pollable for Fetching {
 				result,
 			} => (state, fetch, *sequence, result.as_ref()),
 			FetchingKind::Spliced(spliced) => {
-				// A fetched group is metered here (once), at the tagged handle: the
-				// spliced source track it comes from is the origin's own, untagged.
-				return kio::Pollable::poll(&**spliced, waiter)
-					.map(|res| res.map(|group| group.with_meter(self.stats.meter())));
+				return spliced.poll_classified(waiter);
 			}
 		};
 
-		// Track side: the cached group, the abort error, or past-final. The outer
-		// error is the channel closing without any of those.
+		// A dynamic accept writes its marker after inserting the group. Check it
+		// before the cache lookup, otherwise the newly inserted group would look
+		// like a local hit to a coalesced fetch.
+		let mut handler_pending = false;
+		if let Some(result) = result {
+			match result.poll(waiter, |outcome| {
+				if outcome.accepted_by_dynamic {
+					Poll::Ready(FetchAttempt::Dynamic)
+				} else if let Some(err) = &outcome.rejected {
+					Poll::Ready(FetchAttempt::Rejected(err.clone()))
+				} else {
+					Poll::Pending
+				}
+			}) {
+				Poll::Ready(Ok(FetchAttempt::Dynamic)) => {
+					return match state.poll(waiter, |state| state.poll_fetch_cached(sequence)) {
+						Poll::Ready(Ok(Ok(group))) => Poll::Ready(Ok((group, FetchResolution::Dynamic))),
+						Poll::Ready(Ok(Err(err))) => Poll::Ready(Err(err)),
+						Poll::Ready(Err(closed)) => Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped))),
+						Poll::Pending => Poll::Pending,
+					};
+				}
+				Poll::Ready(Ok(FetchAttempt::Rejected(err))) => return Poll::Ready(Err(err)),
+				Poll::Ready(Err(_closed)) => return Poll::Ready(Err(Error::NotFound)),
+				Poll::Pending => handler_pending = true,
+			}
+		}
+
+		// Track side: a group already in the local cache is a local hit unless a
+		// dynamic handler is still deciding this same queued fetch. In that race,
+		// wait for the handler's terminal marker so an accepted backfill is never
+		// mislabeled as a local hit.
 		match state.poll(waiter, |state| state.poll_fetch_cached(sequence)) {
-			Poll::Ready(Ok(res)) => return Poll::Ready(res.map(|group| group.with_meter(self.stats.meter()))),
+			Poll::Ready(Ok(Ok(group))) if !handler_pending => {
+				return Poll::Ready(Ok((group, FetchResolution::Local)));
+			}
+			Poll::Ready(Ok(Ok(_group))) => {}
+			Poll::Ready(Ok(Err(err))) => return Poll::Ready(Err(err)),
 			Poll::Ready(Err(closed)) => {
 				return Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped)));
 			}
@@ -2118,6 +2191,16 @@ impl kio::Pollable for Fetching {
 			Poll::Ready(Ok(err)) => Poll::Ready(Err(err)),
 			Poll::Ready(Err(_closed)) => Poll::Ready(Err(Error::NotFound)),
 			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	fn record_resolution(&self, resolution: FetchResolution) {
+		if self.resolution.set(resolution).is_ok() {
+			match resolution {
+				FetchResolution::Local => self.stats.fetch_local(),
+				FetchResolution::Dynamic => self.stats.fetch_dynamic(),
+				FetchResolution::Miss => self.stats.fetch_miss(),
+			}
 		}
 	}
 }
@@ -3996,6 +4079,64 @@ mod test {
 
 		// Nothing was queued for the dynamic handler to serve.
 		assert!(dynamic.poll_requested_group(&kio::Waiter::noop()).is_pending());
+	}
+
+	#[tokio::test]
+	async fn fetch_classification_records_local_dynamic_and_miss() {
+		let registry = stats::Registry::new(stats::Config::new());
+		let context = registry.tier(stats::Tier::default()).session("fetch-test");
+		let mut producer = track_producer("test", None);
+		let mut initial = producer.append_group().unwrap();
+		initial
+			.write_frame(Timestamp::ZERO, bytes::Bytes::from_static(b"initial"))
+			.unwrap();
+		initial.finish().unwrap();
+		let consumer = producer.consume().with_stats(context.egress("test"));
+
+		// Already buffered: terminal local-cache resolution. Polling a ready
+		// future twice must not count the same terminal outcome twice.
+		let local = consumer.fetch_group(0, None);
+		assert!(kio::Pollable::poll(&*local, &kio::Waiter::noop()).is_ready());
+		assert!(kio::Pollable::poll(&*local, &kio::Waiter::noop()).is_ready());
+		assert_eq!(local.await.unwrap().sequence, 0);
+
+		// Missing locally but accepted by a Dynamic handler: terminal dynamic resolution.
+		let dynamic = producer.dynamic();
+		let pending = consumer.fetch_group(5, None);
+		assert!(kio::Pollable::poll(&*pending, &kio::Waiter::noop()).is_pending());
+		let request = dynamic.requested_group().await.unwrap();
+		let mut backfill = request.accept(None).unwrap();
+		backfill
+			.write_frame(Timestamp::ZERO, bytes::Bytes::from_static(b"backfill"))
+			.unwrap();
+		backfill.finish().unwrap();
+		assert!(kio::Pollable::poll(&*pending, &kio::Waiter::noop()).is_ready());
+		assert!(kio::Pollable::poll(&*pending, &kio::Waiter::noop()).is_ready());
+		assert_eq!(pending.await.unwrap().sequence, 5);
+		drop(dynamic);
+
+		// No handler and no cached sequence: terminal miss, also polled twice.
+		let miss = consumer.fetch_group(99, None);
+		assert!(kio::Pollable::poll(&*miss, &kio::Waiter::noop()).is_ready());
+		assert!(kio::Pollable::poll(&*miss, &kio::Waiter::noop()).is_ready());
+		assert!(matches!(miss.await, Err(Error::NotFound)));
+
+		let entry = registry
+			.report()
+			.traffic
+			.into_iter()
+			.find(|entry| entry.path.as_str() == "test")
+			.expect("tracked fetch path");
+		assert_eq!(entry.publisher.fetches, 3);
+		assert_eq!(
+			(
+				entry.publisher.fetches_local,
+				entry.publisher.fetches_dynamic,
+				entry.publisher.fetches_miss
+			),
+			(1, 1, 1)
+		);
+		assert_eq!(entry.subscriber.fetches, 0, "fetches are egress-only");
 	}
 
 	#[tokio::test]

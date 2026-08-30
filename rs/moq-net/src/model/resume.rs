@@ -422,6 +422,19 @@ impl kio::Pollable for Fetching {
 	type Output = Result<group::Consumer>;
 
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
+		self.poll_classified(waiter)
+			.map(|result| result.map(|(group, _resolution)| group))
+	}
+}
+
+impl Fetching {
+	/// Poll the newest segment and preserve whether its underlying fetch was local,
+	/// dynamic, or terminally missing. The outer `track::Fetching` owns stats so a
+	/// spliced source cannot be charged to the wrong session or counted twice.
+	pub(crate) fn poll_classified(
+		&self,
+		waiter: &kio::Waiter,
+	) -> Poll<Result<(group::Consumer, track::FetchResolution)>> {
 		let mut inner = self.inner.lock();
 
 		if inner.is_none() {
@@ -448,7 +461,7 @@ impl kio::Pollable for Fetching {
 			*inner = Some(track.fetch_group(self.sequence, self.options.clone()));
 		}
 
-		kio::Pollable::poll(&**inner.as_ref().expect("latched above"), waiter)
+		inner.as_ref().expect("latched above").poll_classified(waiter)
 	}
 }
 

@@ -179,6 +179,11 @@ async fn serve_data_sessions(State(state): State<InternalState>) -> Json<Control
 	Json(state.data_sessions.snapshot())
 }
 
+/// Escape a Prometheus label value according to the text exposition format.
+fn escape_prometheus_label(value: &str) -> String {
+	value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
 /// Render a [`moq_net::stats::Snapshot`] as Prometheus text exposition (v0.0.4).
 ///
 /// Hand-formatted rather than pulling in a metrics registry crate: the atomics
@@ -197,10 +202,11 @@ fn render_metrics(snap: &moq_net::stats::Snapshot) -> String {
 		let _ = writeln!(out, "# HELP {name} {help}");
 		let _ = writeln!(out, "# TYPE {name} counter");
 		for (tier, role, totals) in &traffic {
+			let tier = escape_prometheus_label(tier.as_str());
 			let _ = writeln!(
 				out,
 				"{name}{{tier=\"{}\",role=\"{}\"}} {}",
-				tier.as_str(),
+				tier,
 				role.as_str(),
 				field(totals)
 			);
@@ -233,6 +239,24 @@ fn render_metrics(snap: &moq_net::stats::Snapshot) -> String {
 	);
 	counter(
 		&mut out,
+		"moq_relay_fetches_local_total",
+		"One-shot group fetches resolved from the local track cache.",
+		|c| c.fetches_local,
+	);
+	counter(
+		&mut out,
+		"moq_relay_fetches_dynamic_total",
+		"One-shot group fetches resolved by a dynamic handler.",
+		|c| c.fetches_dynamic,
+	);
+	counter(
+		&mut out,
+		"moq_relay_fetches_miss_total",
+		"One-shot group fetches ending without a group.",
+		|c| c.fetches_miss,
+	);
+	counter(
+		&mut out,
 		"moq_relay_subscriptions_opened_total",
 		"Track subscriptions opened.",
 		|c| c.subscriptions,
@@ -260,11 +284,11 @@ fn render_metrics(snap: &moq_net::stats::Snapshot) -> String {
 	let _ = writeln!(out, "# HELP moq_relay_sessions_opened_total Connected sessions opened.");
 	let _ = writeln!(out, "# TYPE moq_relay_sessions_opened_total counter");
 	for (tier, sessions) in &snap.sessions() {
+		let tier = escape_prometheus_label(tier.as_str());
 		let _ = writeln!(
 			out,
 			"moq_relay_sessions_opened_total{{tier=\"{}\"}} {}",
-			tier.as_str(),
-			sessions.sessions
+			tier, sessions.sessions
 		);
 	}
 	let _ = writeln!(
@@ -273,11 +297,11 @@ fn render_metrics(snap: &moq_net::stats::Snapshot) -> String {
 	);
 	let _ = writeln!(out, "# TYPE moq_relay_sessions_closed_total counter");
 	for (tier, sessions) in &snap.sessions() {
+		let tier = escape_prometheus_label(tier.as_str());
 		let _ = writeln!(
 			out,
 			"moq_relay_sessions_closed_total{{tier=\"{}\"}} {}",
-			tier.as_str(),
-			sessions.sessions_closed
+			tier, sessions.sessions_closed
 		);
 	}
 
@@ -365,6 +389,25 @@ mod tests {
 		assert_eq!(value["sessions"][0]["state"], "connecting");
 	}
 
+	#[test]
+	fn metrics_escape_tier_label_values() {
+		use moq_net::stats::{Registry, Tier};
+
+		let stats = Registry::new(Default::default());
+		let weird = "bad\"\\\nlabel";
+		let _session = stats.tier(Tier::new(weird)).session("root");
+		let body = render_metrics(&stats.snapshot());
+
+		assert!(
+			body.contains(r#"moq_relay_sessions_opened_total{tier="bad\"\\\nlabel"} 1"#),
+			"escaped tier label:\n{body}"
+		);
+		assert!(
+			!body.contains("bad\"\nlabel"),
+			"raw newline must not enter exposition:\n{body}"
+		);
+	}
+
 	/// The `/metrics` renderer emits well-formed Prometheus exposition: a
 	/// HELP/TYPE header per metric and a labeled line carrying the live counter
 	/// value, summed across broadcasts.
@@ -416,6 +459,12 @@ mod tests {
 			group.finish().unwrap();
 		}
 
+		// Fetch classifications are additive to the legacy request counter and
+		// remain split by terminal resolution path. This fetch is resolved from
+		// the local model cache because the group was already read above.
+		let fetch_track = bc.track("video").unwrap();
+		let _fetched = fetch_track.fetch_group(0, None).await.unwrap();
+
 		let body = render_metrics(&stats.snapshot());
 
 		assert!(
@@ -429,6 +478,22 @@ mod tests {
 		assert!(
 			body.contains("moq_relay_bytes_total{tier=\"region/sjc\",role=\"subscriber\"} 56"),
 			"named tier gets its own row:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_fetches_total{tier=\"\",role=\"publisher\"} 1"),
+			"fetch requests:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_fetches_local_total{tier=\"\",role=\"publisher\"} 1"),
+			"local fetches:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_fetches_dynamic_total{tier=\"\",role=\"publisher\"} 0"),
+			"dynamic fetches:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_fetches_miss_total{tier=\"\",role=\"publisher\"} 0"),
+			"fetch misses:\n{body}"
 		);
 		assert!(
 			body.contains("moq_relay_sessions_opened_total{tier=\"\"} 1"),

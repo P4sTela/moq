@@ -47,6 +47,11 @@
 //!   resolves to `NotFound` still counts. Separate from `subscriptions` and the
 //!   viewer refcount; fetched payload still flows into `bytes` / `frames` /
 //!   `groups`.
+//! * `fetches_local` / `fetches_dynamic` / `fetches_miss`: terminal fetch
+//!   classifications. A local fetch resolved from the track cache increments
+//!   `fetches_local`; a `Dynamic` handler that accepts a group increments
+//!   `fetches_dynamic`; a terminal error increments `fetches_miss`. Requests
+//!   dropped before terminal polling affect only `fetches`.
 //! * `bytes` / `frames` / `groups`: cumulative payload counters bumped as
 //!   groups/frames are read (egress) or written (ingress) in the model.
 //! * `datagrams`: cumulative single-frame groups carried over unreliable QUIC
@@ -144,6 +149,12 @@ pub(crate) struct Counters {
 	// once per coalesced fetch, at request time rather than on resolution; does
 	// not touch `subscriptions` or the viewer refcount.
 	fetches: AtomicU64,
+	// Terminal classification of fetches. These are intentionally separate from
+	// `fetches`: a pending request can be dropped before it reaches a terminal
+	// state, and a dynamic handler can resolve several coalesced callers.
+	fetches_local: AtomicU64,
+	fetches_dynamic: AtomicU64,
+	fetches_miss: AtomicU64,
 	broadcasts: AtomicU64,
 	broadcasts_closed: AtomicU64,
 	bytes: AtomicU64,
@@ -169,6 +180,9 @@ impl Counters {
 		let announced_bytes = self.announced_bytes.load(Ordering::Relaxed);
 		let subscriptions = self.subscriptions.load(Ordering::Relaxed);
 		let fetches = self.fetches.load(Ordering::Relaxed);
+		let fetches_local = self.fetches_local.load(Ordering::Relaxed);
+		let fetches_dynamic = self.fetches_dynamic.load(Ordering::Relaxed);
+		let fetches_miss = self.fetches_miss.load(Ordering::Relaxed);
 		let broadcasts = self.broadcasts.load(Ordering::Relaxed);
 		let bytes = self.bytes.load(Ordering::Relaxed);
 		let frames = self.frames.load(Ordering::Relaxed);
@@ -183,6 +197,9 @@ impl Counters {
 			subscriptions,
 			subscriptions_closed,
 			fetches,
+			fetches_local,
+			fetches_dynamic,
+			fetches_miss,
 			bytes,
 			frames,
 			groups,
@@ -247,6 +264,12 @@ pub struct Traffic {
 	/// Separate from `subscriptions` and the viewer refcount. Fetched payload still
 	/// flows into `bytes`/`frames`/`groups`.
 	pub fetches: u64,
+	/// Fetch requests resolved immediately from the local track cache.
+	pub fetches_local: u64,
+	/// Fetch requests resolved by a `Dynamic` handler (normally an upstream FETCH).
+	pub fetches_dynamic: u64,
+	/// Fetch requests that reached a terminal error without a group.
+	pub fetches_miss: u64,
 	/// Cumulative payload bytes.
 	pub bytes: u64,
 	/// Cumulative frames delivered.
@@ -270,6 +293,9 @@ impl Traffic {
 		self.subscriptions += other.subscriptions;
 		self.subscriptions_closed += other.subscriptions_closed;
 		self.fetches += other.fetches;
+		self.fetches_local += other.fetches_local;
+		self.fetches_dynamic += other.fetches_dynamic;
+		self.fetches_miss += other.fetches_miss;
 		self.bytes += other.bytes;
 		self.frames += other.frames;
 		self.groups += other.groups;
@@ -1124,6 +1150,36 @@ impl Scope {
 		}
 	}
 
+	/// Record one fetch resolved from the local track cache.
+	pub(crate) fn fetch_local(&self) {
+		if let Some(counters) = self.counters() {
+			counters.fetches_local.fetch_add(1, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.fetch_local();
+		}
+	}
+
+	/// Record one fetch resolved by a `Dynamic` handler.
+	pub(crate) fn fetch_dynamic(&self) {
+		if let Some(counters) = self.counters() {
+			counters.fetches_dynamic.fetch_add(1, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.fetch_dynamic();
+		}
+	}
+
+	/// Record one fetch that ended without a group.
+	pub(crate) fn fetch_miss(&self) {
+		if let Some(counters) = self.counters() {
+			counters.fetches_miss.fetch_add(1, Ordering::Relaxed);
+		}
+		if let Some(mirror) = &self.mirror {
+			mirror.fetch_miss();
+		}
+	}
+
 	/// Open an announce guard: bumps `announced` and adds the path length to
 	/// `announced_bytes` now; on drop bumps `announced_closed` and adds the path
 	/// length again. Used for egress announce-stream events and ingress
@@ -1652,8 +1708,12 @@ mod tests {
 		let scope = ctx.egress("demo/bbb");
 		scope.fetch();
 		scope.fetch();
+		scope.fetch_local();
+		scope.fetch_dynamic();
+		scope.fetch_miss();
 		let r = tier_counters(&stats, "demo/bbb", &Tier::default()).publisher.snapshot();
 		assert_eq!(r.fetches, 2);
+		assert_eq!((r.fetches_local, r.fetches_dynamic, r.fetches_miss), (1, 1, 1));
 		assert_eq!(r.subscriptions, 0);
 		assert_eq!(r.broadcasts, 0);
 	}
@@ -1701,14 +1761,26 @@ mod tests {
 		// zero), and it survives a roundtrip.
 		let old: Traffic = serde_json::from_str(r#"{"bytes":5}"#).expect("older shape parses");
 		assert_eq!(old.fetches, 0);
+		assert_eq!((old.fetches_local, old.fetches_dynamic, old.fetches_miss), (0, 0, 0));
 
 		let t = Traffic {
 			fetches: 9,
+			fetches_local: 3,
+			fetches_dynamic: 4,
+			fetches_miss: 2,
 			..Default::default()
 		};
 		let json = serde_json::to_string(&t).unwrap();
 		let back: Traffic = serde_json::from_str(&json).unwrap();
-		assert_eq!(back.fetches, 9);
+		assert_eq!(
+			(
+				back.fetches,
+				back.fetches_local,
+				back.fetches_dynamic,
+				back.fetches_miss
+			),
+			(9, 3, 4, 2)
+		);
 	}
 
 	#[test]

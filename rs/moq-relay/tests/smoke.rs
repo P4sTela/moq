@@ -195,13 +195,10 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	// present in the relay cache before the late-join phase begins.
 	let early_origin = Origin::random().produce();
 	let mut early_announcements = early_origin.consume().announced();
-	let early_session = tokio::time::timeout(
-		TIMEOUT,
-		client().with_subscriber(early_origin).connect(url.clone()),
-	)
-	.await
-	.expect("early subscriber connect timeout")
-	.expect("early subscriber connect failed");
+	let early_session = tokio::time::timeout(TIMEOUT, client().with_subscriber(early_origin).connect(url.clone()))
+		.await
+		.expect("early subscriber connect timeout")
+		.expect("early subscriber connect failed");
 	let moq_net::announce::Update {
 		path: early_path,
 		broadcast: early_broadcast,
@@ -258,13 +255,10 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	// The late subscriber joins at the current state while the source is alive.
 	let late_origin = Origin::random().produce();
 	let mut late_announcements = late_origin.consume().announced();
-	let late_session = tokio::time::timeout(
-		TIMEOUT,
-		client().with_subscriber(late_origin).connect(url),
-	)
-	.await
-	.expect("late subscriber connect timeout")
-	.expect("late subscriber connect failed");
+	let late_session = tokio::time::timeout(TIMEOUT, client().with_subscriber(late_origin).connect(url))
+		.await
+		.expect("late subscriber connect timeout")
+		.expect("late subscriber connect failed");
 	let moq_net::announce::Update {
 		path: late_path,
 		broadcast: late_broadcast,
