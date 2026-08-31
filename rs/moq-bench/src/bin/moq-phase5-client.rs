@@ -445,7 +445,7 @@ async fn run_publisher(args: Args) -> Result<()> {
 	first_current.finish().context("finish state-1")?;
 	let state1_ns = monotonic_ns();
 
-	if matches!(args.stratum, Stratum::RetentionBoundary) {
+	let state2_ns = if matches!(args.stratum, Stratum::RetentionBoundary) {
 		tokio::time::sleep(CACHE_DURATION + Duration::from_millis(100)).await;
 		let mut boundary = track.append_group().context("append state-2")?;
 		boundary
@@ -455,7 +455,10 @@ async fn run_publisher(args: Args) -> Result<()> {
 			)
 			.context("write state-2")?;
 		boundary.finish().context("finish state-2")?;
-	}
+		Some(monotonic_ns())
+	} else {
+		None
+	};
 	early_task.await.context("early materializer task join")??;
 	let current_ns = monotonic_ns();
 	write_json(
@@ -501,6 +504,7 @@ async fn run_publisher(args: Args) -> Result<()> {
 				"publisher_start": started_ns,
 				"publisher_connected": connected_ns,
 				"state_1_written": state1_ns,
+				"state_2_written": state2_ns,
 				"current_state_ready": current_ns,
 				"publisher_disconnected": disconnected_ns,
 				"finished": finished_ns
