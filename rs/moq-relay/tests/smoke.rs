@@ -203,6 +203,12 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		.map(|raw| raw.parse::<usize>().expect("MOQ_PHASE5_PEER_COUNT must be an integer"))
 		.unwrap_or(1);
 	assert!(matches!(peer_count, 1 | 4 | 8), "peer count must be one of 1, 4, or 8");
+	let stratum = std::env::var("MOQ_PHASE5_STRATUM").unwrap_or_else(|_| "source-alive".into());
+	assert!(
+		matches!(stratum.as_str(), "source-alive" | "retention-boundary"),
+		"stratum must be source-alive or retention-boundary"
+	);
+	let retention_boundary = stratum == "retention-boundary";
 
 	let (port, web_handle, stats) = spawn_relay_with_cache_and_stats(Some(Duration::from_secs(5))).await;
 	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
@@ -266,13 +272,15 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		.expect("early group closed");
 	assert_eq!(&early_frame.payload[..], b"state-0");
 
-	// A second group establishes a live edge while retaining group 0.
+	// Group 1 establishes the live edge while retaining group 0. For the
+	// retention-boundary stratum, a later group 2 write triggers the canonical
+	// duration eviction check after group 0 has aged past five seconds.
 	tokio::time::sleep(Duration::from_millis(100)).await;
-	let mut current_group = track.append_group().expect("append current group");
-	current_group
+	let mut first_current_group = track.append_group().expect("append first current group");
+	first_current_group
 		.write_frame(moq_net::Timestamp::from_millis(100).unwrap(), b"state-1".as_ref())
-		.expect("write current state");
-	current_group.finish().expect("finish current state");
+		.expect("write first current state");
+	first_current_group.finish().expect("finish first current state");
 	let mut early_current = tokio::time::timeout(TIMEOUT, early_sub.recv_group())
 		.await
 		.expect("early current group timeout")
@@ -285,6 +293,29 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		.expect("early current frame receive failed")
 		.expect("early current group closed");
 	assert_eq!(&early_current_frame.payload[..], b"state-1");
+	let (current_sequence, current_payload): (u64, &[u8]) = if retention_boundary {
+		tokio::time::sleep(Duration::from_millis(5100)).await;
+		let mut boundary_group = track.append_group().expect("append boundary group");
+		boundary_group
+			.write_frame(moq_net::Timestamp::from_millis(5200).unwrap(), b"state-2".as_ref())
+			.expect("write boundary state");
+		boundary_group.finish().expect("finish boundary state");
+		let mut early_boundary = tokio::time::timeout(TIMEOUT, early_sub.recv_group())
+			.await
+			.expect("early boundary group timeout")
+			.expect("early boundary group receive failed")
+			.expect("early track closed at boundary");
+		assert_eq!(early_boundary.sequence, 2);
+		let early_boundary_frame = tokio::time::timeout(TIMEOUT, early_boundary.read_frame())
+			.await
+			.expect("early boundary frame timeout")
+			.expect("early boundary frame receive failed")
+			.expect("early boundary group closed");
+		assert_eq!(&early_boundary_frame.payload[..], b"state-2");
+		(2, b"state-2".as_ref())
+	} else {
+		(1, b"state-1".as_ref())
+	};
 	drop(early_sub);
 	drop(early_session);
 
@@ -324,14 +355,14 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				.expect("late track closed");
 			let first_group_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
 			let late_ttfs_ms = subscribe_started.elapsed().as_secs_f64() * 1000.0;
-			assert_eq!(late_group.sequence, 1);
+			assert_eq!(late_group.sequence, current_sequence);
 			let late_frame = tokio::time::timeout(TIMEOUT, late_group.read_frame())
 				.await
 				.expect("late current frame timeout")
 				.expect("late current frame receive failed")
 				.expect("late current group closed");
 			let first_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
-			assert_eq!(&late_frame.payload[..], b"state-1");
+			assert_eq!(&late_frame.payload[..], current_payload);
 
 			// Fetch the older group while the upstream source is still connected.
 			// This is retained-history evidence, not a source-loss persistence claim.
@@ -364,7 +395,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				},
 				"current_state": {
 					"sequence": late_group.sequence,
-					"payload": String::from_utf8(late_frame.payload.to_vec()).expect("current payload is UTF-8")
+					"payload": String::from_utf8(current_payload.to_vec()).expect("current payload is UTF-8")
 				},
 				"history": {
 					"sequence": historical.sequence,
@@ -417,6 +448,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		let artifact = serde_json::json!({
 			"schema_version": 1,
 			"test": "relay_websocket_late_join_replays_retained_history_while_source_alive",
+			"stratum": stratum,
 			"peer_count": peer_count,
 			"cache": {
 				"capacity": "64MiB",
@@ -424,7 +456,10 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				"cluster_linger_ms": 5000,
 				"track_latency_max_ms": 30000
 			},
-			"current_state": {"sequence": 1, "payload": "state-1"},
+			"current_state": {
+				"sequence": current_sequence,
+				"payload": String::from_utf8(current_payload.to_vec()).expect("artifact current payload is UTF-8")
+			},
 			"history": {"sequence": 0, "payload": "state-0"},
 			"timing_ms": {
 				"current_state_ttfs": current_state_ttfs_ms,
@@ -444,7 +479,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	}
 
 	eprintln!(
-		"phase5_late_join peer_count={peer_count} cache_duration=5s current_sequence=1 history_sequence=0 source_alive=true fetches={} local={} dynamic={} miss={}",
+		"phase5_late_join peer_count={peer_count} stratum={stratum} cache_duration=5s current_sequence={current_sequence} history_sequence=0 source_alive=true fetches={} local={} dynamic={} miss={}",
 		fetch_telemetry.fetches,
 		fetch_telemetry.fetches_local,
 		fetch_telemetry.fetches_dynamic,
