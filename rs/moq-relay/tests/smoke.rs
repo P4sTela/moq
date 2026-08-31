@@ -205,10 +205,15 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	assert!(matches!(peer_count, 1 | 4 | 8), "peer count must be one of 1, 4, or 8");
 	let stratum = std::env::var("MOQ_PHASE5_STRATUM").unwrap_or_else(|_| "source-alive".into());
 	assert!(
-		matches!(stratum.as_str(), "source-alive" | "retention-boundary"),
-		"stratum must be source-alive or retention-boundary"
+		matches!(stratum.as_str(), "source-alive" | "retention-boundary" | "source-loss"),
+		"stratum must be source-alive, retention-boundary, or source-loss"
 	);
 	let retention_boundary = stratum == "retention-boundary";
+	let source_loss = stratum == "source-loss";
+	assert!(
+		!source_loss || peer_count == 1,
+		"source-loss currently supports peer count 1 only"
+	);
 
 	let (port, web_handle, stats) = spawn_relay_with_cache_and_stats(Some(Duration::from_secs(5))).await;
 	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
@@ -322,9 +327,15 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	// Late subscribers join the current state concurrently while the source is alive.
 	// Each session is a distinct peer; keeping the session inside the future ensures
 	// all peer subscriptions overlap instead of becoming a sequential loopback.
+	// D pauses the peer after current-state delivery so the parent can drop the
+	// publisher before the history FETCH begins.
+	let source_loss_ready = std::sync::Arc::new(tokio::sync::Notify::new());
+	let source_loss_release = std::sync::Arc::new(tokio::sync::Notify::new());
 	let phase_started = std::time::Instant::now();
-	let peer_observations = futures::future::join_all((0..peer_count).map(|peer_id| {
+	let late_futures = futures::future::join_all((0..peer_count).map(|peer_id| {
 		let phase_started = phase_started.clone();
+		let source_loss_ready = source_loss_ready.clone();
+		let source_loss_release = source_loss_release.clone();
 		let url = url.clone();
 		async move {
 			let late_origin = Origin::random().produce();
@@ -363,24 +374,73 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				.expect("late current group closed");
 			let first_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
 			assert_eq!(&late_frame.payload[..], current_payload);
+			if source_loss {
+				source_loss_ready.notify_one();
+				source_loss_release.notified().await;
+			}
 
-			// Fetch the older group while the upstream source is still connected.
-			// This is retained-history evidence, not a source-loss persistence claim.
+			// Fetch the older group. A/B/C keep the source alive and require the
+			// retained group. D has already dropped the publisher and records the
+			// negative-control outcome without turning it into a test panic.
 			let fetch_started = std::time::Instant::now();
 			let fetch_start_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
-			let mut historical = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None))
-				.await
-				.expect("historical fetch timeout")
-				.expect("historical fetch failed while source is alive");
-			let historical_frame = tokio::time::timeout(TIMEOUT, historical.read_frame())
-				.await
-				.expect("historical frame timeout")
-				.expect("historical frame receive failed")
-				.expect("historical group closed");
-			let history_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
-			let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
-			assert_eq!(historical.sequence, 0);
-			assert_eq!(&historical_frame.payload[..], b"state-0");
+			let (history, history_frame_ms, history_ttfs_ms) = if source_loss {
+				let fetched = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None)).await;
+				let (restored, sequence, payload, error) = match fetched {
+					Ok(Ok(mut historical)) => match tokio::time::timeout(TIMEOUT, historical.read_frame()).await {
+						Ok(Ok(Some(frame))) => (
+							true,
+							Some(historical.sequence),
+							Some(String::from_utf8(frame.payload.to_vec()).expect("history payload is UTF-8")),
+							None,
+						),
+						Ok(Ok(None)) => (
+							false,
+							Some(historical.sequence),
+							None,
+							Some("history group closed".into()),
+						),
+						Ok(Err(err)) => (false, Some(historical.sequence), None, Some(format!("frame: {err:?}"))),
+						Err(_) => (false, Some(historical.sequence), None, Some("frame timeout".into())),
+					},
+					Ok(Err(err)) => (false, None, None, Some(format!("fetch: {err:?}"))),
+					Err(_) => (false, None, None, Some("fetch timeout".into())),
+				};
+				let history_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+				let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
+				(
+					serde_json::json!({
+						"restored": restored,
+						"sequence": sequence,
+						"payload": payload,
+						"error": error
+					}),
+					history_frame_ms,
+					history_ttfs_ms,
+				)
+			} else {
+				let mut historical = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None))
+					.await
+					.expect("historical fetch timeout")
+					.expect("historical fetch failed while source is alive");
+				let historical_frame = tokio::time::timeout(TIMEOUT, historical.read_frame())
+					.await
+					.expect("historical frame timeout")
+					.expect("historical frame receive failed")
+					.expect("historical group closed");
+				let history_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+				let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
+				assert_eq!(historical.sequence, 0);
+				assert_eq!(&historical_frame.payload[..], b"state-0");
+				(
+					serde_json::json!({
+						"sequence": historical.sequence,
+						"payload": String::from_utf8(historical_frame.payload.to_vec()).expect("history payload is UTF-8")
+					}),
+					history_frame_ms,
+					history_ttfs_ms,
+				)
+			};
 
 			let observation = serde_json::json!({
 				"peer_id": peer_id,
@@ -397,24 +457,34 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 					"sequence": late_group.sequence,
 					"payload": String::from_utf8(current_payload.to_vec()).expect("current payload is UTF-8")
 				},
-				"history": {
-					"sequence": historical.sequence,
-					"payload": String::from_utf8(historical_frame.payload.to_vec()).expect("history payload is UTF-8")
-				},
+				"history": history,
 				"timing_ms": {
 					"current_state_ttfs": late_ttfs_ms,
 					"current_state_first_frame": first_frame_ms - subscribe_start_ms,
 					"history_fetch": history_ttfs_ms
 				},
-				"source_alive": true
+				"source_alive": !source_loss
 			});
 			drop(late_sub);
 			drop(late_session);
 			observation
 		}
-	}))
-	.await;
+	}));
+	tokio::pin!(late_futures);
+	let peer_observations = if source_loss {
+		tokio::select! {
+			_ = &mut late_futures => panic!("source-loss peer completed before publisher disconnect"),
+			_ = source_loss_ready.notified() => {
+				drop(pub_session);
+				source_loss_release.notify_one();
+				late_futures.await
+			}
+		}
+	} else {
+		late_futures.await
+	};
 
+	let history_summary = peer_observations.first().expect("at least one late peer observation")["history"].clone();
 	let fetch_telemetry =
 		stats
 			.report()
@@ -460,7 +530,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				"sequence": current_sequence,
 				"payload": String::from_utf8(current_payload.to_vec()).expect("artifact current payload is UTF-8")
 			},
-			"history": {"sequence": 0, "payload": "state-0"},
+			"history": history_summary,
 			"timing_ms": {
 				"current_state_ttfs": current_state_ttfs_ms,
 				"history_fetch": history_fetch_ms
@@ -472,21 +542,21 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				"fetches_miss": fetch_telemetry.fetches_miss
 			},
 			"peers": peer_observations,
-			"source_alive": true
+			"source_alive": !source_loss
 		});
 		let encoded = serde_json::to_vec_pretty(&artifact).expect("serialize Phase 5 artifact");
 		std::fs::write(path, encoded).expect("write Phase 5 artifact");
 	}
 
 	eprintln!(
-		"phase5_late_join peer_count={peer_count} stratum={stratum} cache_duration=5s current_sequence={current_sequence} history_sequence=0 source_alive=true fetches={} local={} dynamic={} miss={}",
+		"phase5_late_join peer_count={peer_count} stratum={stratum} cache_duration=5s current_sequence={current_sequence} source_alive={} fetches={} local={} dynamic={} miss={}",
+		!source_loss,
 		fetch_telemetry.fetches,
 		fetch_telemetry.fetches_local,
 		fetch_telemetry.fetches_dynamic,
 		fetch_telemetry.fetches_miss
 	);
 
-	drop(pub_session);
 	drop(track);
 	drop(broadcast);
 	web_handle.abort();
