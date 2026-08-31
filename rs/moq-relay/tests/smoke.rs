@@ -192,11 +192,10 @@ fn client_version(version: Option<moq_net::Version>) -> moq_native::Client {
 }
 
 /// A canonical cache/late-join canary. The early subscriber forces the relay to
-/// materialize both state groups, and the late subscriber starts at the live edge
-/// before fetching the older retained group while the publisher remains connected.
-/// Publisher-disconnect persistence is intentionally not asserted here: the
-/// canonical relay releases an aborted source track when its lingered broadcast
-/// eventually closes, which is a separate future-work contract.
+/// materialize the state groups, and late subscribers start at the live edge
+/// before fetching the older retained group. Source-alive, retention-boundary,
+/// and source-loss negative-control strata are selected by environment for the
+/// artifact runner.
 #[tokio::test]
 async fn relay_websocket_late_join_replays_retained_history_while_source_alive() {
 	let peer_count = std::env::var("MOQ_PHASE5_PEER_COUNT")
@@ -218,7 +217,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	let (port, web_handle, stats) = spawn_relay_with_cache_and_stats(Some(Duration::from_secs(5))).await;
 	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
 
-	// Publish an overwrite-style current-state track with two complete groups.
+	// Publish an overwrite-style current-state track with baseline complete groups.
 	let pub_origin = Origin::random().produce();
 	let mut broadcast = pub_origin
 		.create_broadcast("late-join", moq_net::broadcast::Route::new().with_announce(true))
