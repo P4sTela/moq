@@ -73,6 +73,21 @@ struct Args {
 
 	#[arg(long, env = "MP_PHASE5_WAIT_TIMEOUT_MS", default_value_t = 30_000)]
 	wait_timeout_ms: u64,
+
+	#[arg(long, env = "MP_PHASE5_EXPECT_ABSENT", default_value_t = false)]
+	expect_absent: bool,
+
+	#[arg(long, env = "MP_PHASE5_ABSENCE_WINDOW_MS", default_value_t = 3_000)]
+	absence_window_ms: u64,
+
+	#[arg(long, env = "MP_PHASE5_RELAY_ID")]
+	relay_id: Option<String>,
+
+	#[arg(long, env = "MP_PHASE5_AREA_ID")]
+	area_id: Option<String>,
+
+	#[arg(long, env = "MP_PHASE5_EXPECTED_ABSENT_PEERS", default_value = "")]
+	expected_absent_peers: String,
 }
 
 fn monotonic_ns() -> u64 {
@@ -83,9 +98,9 @@ fn monotonic_ns() -> u64 {
 		// supported on the Unix targets used by the mesh containers.
 		let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) };
 		assert_eq!(result, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
-		return (value.tv_sec as u64)
+		(value.tv_sec as u64)
 			.saturating_mul(1_000_000_000)
-			.saturating_add(value.tv_nsec as u64);
+			.saturating_add(value.tv_nsec as u64)
 	}
 
 	#[cfg(not(unix))]
@@ -140,20 +155,44 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> Result<()> {
 	}
 }
 
-async fn wait_for_peer_markers(schedule_dir: &Path, prefix: &str, peer_count: usize, timeout: Duration) -> Result<()> {
+async fn wait_for_expected_peer_markers(
+	schedule_dir: &Path,
+	prefix: &str,
+	expected_peer_ids: &[usize],
+	timeout: Duration,
+) -> Result<()> {
 	let deadline = Instant::now() + timeout;
 	loop {
-		if (0..peer_count).all(|peer_id| peer_marker(schedule_dir, prefix, peer_id).is_file()) {
+		if expected_peer_ids
+			.iter()
+			.all(|peer_id| peer_marker(schedule_dir, prefix, *peer_id).is_file())
+		{
 			return Ok(());
 		}
 		if Instant::now() >= deadline {
-			bail!(
-				"timed out waiting for {prefix}-0..{prefix}-{}",
-				peer_count.saturating_sub(1)
-			);
+			bail!("timed out waiting for {prefix} markers for peers {expected_peer_ids:?}");
 		}
 		tokio::time::sleep(Duration::from_millis(25)).await;
 	}
+}
+
+fn parse_peer_ids(value: &str, peer_count: usize) -> Result<Vec<usize>> {
+	let mut peer_ids = Vec::new();
+	for raw in value.split(',').map(str::trim).filter(|raw| !raw.is_empty()) {
+		let peer_id = raw
+			.parse::<usize>()
+			.with_context(|| format!("invalid expected absent peer id: {raw:?}"))?;
+		ensure!(
+			peer_id < peer_count,
+			"expected absent peer {peer_id} is outside peer count {peer_count}"
+		);
+		ensure!(
+			!peer_ids.contains(&peer_id),
+			"expected absent peer {peer_id} is listed more than once"
+		);
+		peer_ids.push(peer_id);
+	}
+	Ok(peer_ids)
 }
 
 async fn receive_group(
@@ -252,6 +291,82 @@ async fn run_early(args: Args) -> Result<()> {
 	Ok(())
 }
 
+async fn run_expected_absence(args: Args) -> Result<()> {
+	ensure!(args.absence_window_ms > 0, "absence window must be positive");
+	let timeout = Duration::from_millis(args.wait_timeout_ms);
+	let ready = marker_path(&args.schedule_dir, "phase5-publisher-ready.json");
+	wait_for_file(&ready, timeout).await?;
+
+	let connect_started_ns = monotonic_ns();
+	let origin = Origin::random().produce();
+	let mut announcements = origin.consume().announced();
+	let session = tokio::time::timeout(TIMEOUT, client().with_subscriber(origin).connect(url(&args)?))
+		.await
+		.context("expected-absence subscriber connect timeout")?
+		.context("expected-absence subscriber connect failed")?;
+	let connect_ready_ns = monotonic_ns();
+	let publisher_disconnected_observed_ns = if matches!(args.stratum, Stratum::SourceLoss) {
+		wait_for_file(
+			&marker_path(&args.schedule_dir, "phase5-publisher-disconnected.json"),
+			timeout,
+		)
+		.await?;
+		Some(monotonic_ns())
+	} else {
+		None
+	};
+	let absence_window_start_ns = monotonic_ns();
+	let announcement = tokio::time::timeout(Duration::from_millis(args.absence_window_ms), announcements.next()).await;
+	let absence_window_end_ns = monotonic_ns();
+	let (announcement_observed, window_completed, observed_path) = match announcement {
+		Err(_) => (false, true, None),
+		Ok(Some(update)) => (true, false, Some(update.path.to_string())),
+		Ok(None) => (false, false, None),
+	};
+	let artifact = json!({
+		"schema_version": 1,
+		"role": "late",
+		"stratum": args.stratum.as_str(),
+		"peer_id": args.peer_id,
+		"peer_count": args.peer_count,
+		"relay_id": args.relay_id,
+		"area_id": args.area_id,
+		"relay_url": args.relay_url,
+		"broadcast_path": args.broadcast_path,
+		"events_ns": {
+			"connect_start": connect_started_ns,
+			"connect_ready": connect_ready_ns,
+			"publisher_disconnected_observed": publisher_disconnected_observed_ns,
+			"absence_window_start": absence_window_start_ns,
+			"absence_window_end": absence_window_end_ns
+		},
+		"expected_absence": {
+			"announcement_observed": announcement_observed,
+			"window_completed": window_completed,
+			"publisher_disconnected_observed": publisher_disconnected_observed_ns.is_some(),
+			"window_ms": args.absence_window_ms,
+			"window_start": absence_window_start_ns,
+			"window_end": absence_window_end_ns,
+			"broadcast_path": args.broadcast_path,
+			"observed_path": observed_path
+		},
+		"current_state": Value::Null,
+		"history": Value::Null,
+		"source_alive": !matches!(args.stratum, Stratum::SourceLoss)
+	});
+	write_json(&args.artifact, &artifact)?;
+	drop(session);
+	ensure!(
+		!announcement_observed,
+		"unexpected announcement for expected-absence peer"
+	);
+	ensure!(
+		window_completed,
+		"announcement stream closed before absence window completed"
+	);
+	Ok(())
+}
+
 async fn run_late(args: Args) -> Result<()> {
 	ensure!(
 		args.peer_id < args.peer_count,
@@ -259,6 +374,9 @@ async fn run_late(args: Args) -> Result<()> {
 		args.peer_id,
 		args.peer_count
 	);
+	if args.expect_absent {
+		return run_expected_absence(args).await;
+	}
 	let timeout = Duration::from_millis(args.wait_timeout_ms);
 	let (expected_sequence, expected_payload) = args.stratum.current();
 	let ready = marker_path(&args.schedule_dir, "phase5-publisher-ready.json");
@@ -382,6 +500,10 @@ async fn run_late(args: Args) -> Result<()> {
 		"stratum": args.stratum.as_str(),
 		"peer_id": args.peer_id,
 		"peer_count": args.peer_count,
+		"relay_id": args.relay_id,
+		"area_id": args.area_id,
+		"relay_url": args.relay_url,
+		"broadcast_path": args.broadcast_path,
 		"events_ns": {
 			"connect_start": connect_started_ns,
 			"connect_ready": connect_ready_ns,
@@ -414,6 +536,14 @@ async fn run_late(args: Args) -> Result<()> {
 
 async fn run_publisher(args: Args) -> Result<()> {
 	ensure!(args.peer_count >= 1, "peer count must be positive");
+	let absent_peer_ids = parse_peer_ids(&args.expected_absent_peers, args.peer_count)?;
+	let expected_peer_ids: Vec<usize> = (0..args.peer_count)
+		.filter(|peer_id| !absent_peer_ids.contains(peer_id))
+		.collect();
+	ensure!(
+		!expected_peer_ids.is_empty(),
+		"at least one positive Phase 5 peer is required"
+	);
 	let timeout = Duration::from_millis(args.wait_timeout_ms);
 	let (expected_sequence, expected_payload) = args.stratum.current();
 	let started_ns = monotonic_ns();
@@ -491,7 +621,7 @@ async fn run_publisher(args: Args) -> Result<()> {
 	};
 	let late_task = tokio::spawn(run_late(late_args));
 	let disconnected_ns = if matches!(args.stratum, Stratum::SourceLoss) {
-		wait_for_peer_markers(&args.schedule_dir, "phase5-current-ack", args.peer_count, timeout).await?;
+		wait_for_expected_peer_markers(&args.schedule_dir, "phase5-current-ack", &expected_peer_ids, timeout).await?;
 		drop(pub_session);
 		let disconnected_ns = monotonic_ns();
 		write_json(
@@ -500,7 +630,7 @@ async fn run_publisher(args: Args) -> Result<()> {
 		)?;
 		Some(disconnected_ns)
 	} else {
-		wait_for_peer_markers(&args.schedule_dir, "phase5-done", args.peer_count, timeout).await?;
+		wait_for_expected_peer_markers(&args.schedule_dir, "phase5-done", &expected_peer_ids, timeout).await?;
 		None
 	};
 	late_task.await.context("late peer 0 task join")??;
