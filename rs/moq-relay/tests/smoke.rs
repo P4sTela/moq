@@ -168,6 +168,11 @@ fn client_version(version: Option<moq_net::Version>) -> moq_native::Client {
 /// eventually closes, which is a separate future-work contract.
 #[tokio::test]
 async fn relay_websocket_late_join_replays_retained_history_while_source_alive() {
+	let peer_count = std::env::var("MOQ_PHASE5_PEER_COUNT")
+		.map(|raw| raw.parse::<usize>().expect("MOQ_PHASE5_PEER_COUNT must be an integer"))
+		.unwrap_or(1);
+	assert!(matches!(peer_count, 1 | 4 | 8), "peer count must be one of 1, 4, or 8");
+
 	let (port, web_handle) = spawn_relay_with_cache(Some(Duration::from_secs(5))).await;
 	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
 
@@ -252,77 +257,116 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	drop(early_sub);
 	drop(early_session);
 
-	// The late subscriber joins at the current state while the source is alive.
-	let late_origin = Origin::random().produce();
-	let mut late_announcements = late_origin.consume().announced();
-	let late_session = tokio::time::timeout(TIMEOUT, client().with_subscriber(late_origin).connect(url))
-		.await
-		.expect("late subscriber connect timeout")
-		.expect("late subscriber connect failed");
-	let moq_net::announce::Update {
-		path: late_path,
-		broadcast: late_broadcast,
-	} = tokio::time::timeout(TIMEOUT, late_announcements.next())
-		.await
-		.expect("late announcement timeout")
-		.expect("late origin closed");
-	assert_eq!(late_path.as_str(), "late-join");
-	let late_broadcast = late_broadcast.expect("expected late announce");
-	let late_track = late_broadcast.track("state").expect("late state track");
-	let subscribe_started = std::time::Instant::now();
-	let mut late_sub = late_track.clone().subscribe(None).await.expect("late state subscribe");
-	let mut late_group = tokio::time::timeout(TIMEOUT, late_sub.recv_group())
-		.await
-		.expect("late current group timeout")
-		.expect("late current group receive failed")
-		.expect("late track closed");
-	let late_ttfs_ms = subscribe_started.elapsed().as_secs_f64() * 1000.0;
-	assert_eq!(late_group.sequence, 1);
-	let late_frame = tokio::time::timeout(TIMEOUT, late_group.read_frame())
-		.await
-		.expect("late current frame timeout")
-		.expect("late current frame receive failed")
-		.expect("late current group closed");
-	assert_eq!(&late_frame.payload[..], b"state-1");
+	// Late subscribers join the current state concurrently while the source is alive.
+	// Each session is a distinct peer; keeping the session inside the future ensures
+	// all peer subscriptions overlap instead of becoming a sequential loopback.
+	let phase_started = std::time::Instant::now();
+	let peer_observations = futures::future::join_all((0..peer_count).map(|peer_id| {
+		let phase_started = phase_started.clone();
+		let url = url.clone();
+		async move {
+			let late_origin = Origin::random().produce();
+			let mut late_announcements = late_origin.consume().announced();
+			let connect_started = std::time::Instant::now();
+			let late_session = tokio::time::timeout(TIMEOUT, client().with_subscriber(late_origin).connect(url))
+				.await
+				.expect("late subscriber connect timeout")
+				.expect("late subscriber connect failed");
+			let connect_ready_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			let moq_net::announce::Update {
+				path: late_path,
+				broadcast: late_broadcast,
+			} = tokio::time::timeout(TIMEOUT, late_announcements.next())
+				.await
+				.expect("late announcement timeout")
+				.expect("late origin closed");
+			assert_eq!(late_path.as_str(), "late-join");
+			let late_broadcast = late_broadcast.expect("expected late announce");
+			let late_track = late_broadcast.track("state").expect("late state track");
+			let subscribe_started = std::time::Instant::now();
+			let subscribe_start_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			let mut late_sub = late_track.clone().subscribe(None).await.expect("late state subscribe");
+			let mut late_group = tokio::time::timeout(TIMEOUT, late_sub.recv_group())
+				.await
+				.expect("late current group timeout")
+				.expect("late current group receive failed")
+				.expect("late track closed");
+			let first_group_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			let late_ttfs_ms = subscribe_started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(late_group.sequence, 1);
+			let late_frame = tokio::time::timeout(TIMEOUT, late_group.read_frame())
+				.await
+				.expect("late current frame timeout")
+				.expect("late current frame receive failed")
+				.expect("late current group closed");
+			let first_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(&late_frame.payload[..], b"state-1");
 
-	// Fetch the older group while the upstream source is still connected. This
-	// exercises the canonical retained-group path without conflating it with
-	// publisher-disconnect persistence, which is not guaranteed by `cluster.linger`.
-	let fetch_started = std::time::Instant::now();
-	let mut historical = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None))
-		.await
-		.expect("historical fetch timeout")
-		.expect("historical fetch failed while source is alive");
-	let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
-	let historical_frame = tokio::time::timeout(TIMEOUT, historical.read_frame())
-		.await
-		.expect("historical frame timeout")
-		.expect("historical frame receive failed")
-		.expect("historical group closed");
-	assert_eq!(&historical_frame.payload[..], b"state-0");
+			// Fetch the older group while the upstream source is still connected.
+			// This is retained-history evidence, not a source-loss persistence claim.
+			let fetch_started = std::time::Instant::now();
+			let fetch_start_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			let mut historical = tokio::time::timeout(TIMEOUT, late_track.fetch_group(0, None))
+				.await
+				.expect("historical fetch timeout")
+				.expect("historical fetch failed while source is alive");
+			let historical_frame = tokio::time::timeout(TIMEOUT, historical.read_frame())
+				.await
+				.expect("historical frame timeout")
+				.expect("historical frame receive failed")
+				.expect("historical group closed");
+			let history_frame_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+			let history_ttfs_ms = fetch_started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(historical.sequence, 0);
+			assert_eq!(&historical_frame.payload[..], b"state-0");
+
+			let observation = serde_json::json!({
+				"peer_id": peer_id,
+				"events_ms": {
+					"connect_start": (connect_started.duration_since(phase_started)).as_secs_f64() * 1000.0,
+					"connect_ready": connect_ready_ms,
+					"subscribe_start": subscribe_start_ms,
+					"first_group": first_group_ms,
+					"first_frame": first_frame_ms,
+					"fetch_start": fetch_start_ms,
+					"history_frame": history_frame_ms
+				},
+				"current_state": {
+					"sequence": late_group.sequence,
+					"payload": String::from_utf8(late_frame.payload.to_vec()).expect("current payload is UTF-8")
+				},
+				"history": {
+					"sequence": historical.sequence,
+					"payload": String::from_utf8(historical_frame.payload.to_vec()).expect("history payload is UTF-8")
+				},
+				"timing_ms": {
+					"current_state_ttfs": late_ttfs_ms,
+					"current_state_first_frame": first_frame_ms - subscribe_start_ms,
+					"history_fetch": history_ttfs_ms
+				},
+				"source_alive": true
+			});
+			drop(late_sub);
+			drop(late_session);
+			observation
+		}
+	}))
+	.await;
 
 	if let Some(path) = std::env::var_os("MOQ_PHASE5_ARTIFACT") {
 		let artifact = serde_json::json!({
 			"schema_version": 1,
 			"test": "relay_websocket_late_join_replays_retained_history_while_source_alive",
+			"peer_count": peer_count,
 			"cache": {
 				"capacity": "64MiB",
 				"duration_ms": 5000,
 				"cluster_linger_ms": 5000,
 				"track_latency_max_ms": 30000
 			},
-			"current_state": {
-				"sequence": late_group.sequence,
-				"payload": String::from_utf8(late_frame.payload.to_vec()).expect("current payload is UTF-8")
-			},
-			"history": {
-				"sequence": historical.sequence,
-				"payload": String::from_utf8(historical_frame.payload.to_vec()).expect("history payload is UTF-8")
-			},
-			"timing_ms": {
-				"current_state_ttfs": late_ttfs_ms,
-				"history_fetch": history_ttfs_ms
-			},
+			"current_state": {"sequence": 1, "payload": "state-1"},
+			"history": {"sequence": 0, "payload": "state-0"},
+			"peers": peer_observations,
 			"source_alive": true
 		});
 		let encoded = serde_json::to_vec_pretty(&artifact).expect("serialize Phase 5 artifact");
@@ -330,11 +374,9 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	}
 
 	eprintln!(
-		"phase5_late_join cache_duration=5s current_sequence=1 history_sequence=0 ttfs_ms={late_ttfs_ms:.3} history_ttfs_ms={history_ttfs_ms:.3} source_alive=true"
+		"phase5_late_join peer_count={peer_count} cache_duration=5s current_sequence=1 history_sequence=0 source_alive=true"
 	);
 
-	drop(late_sub);
-	drop(late_session);
 	drop(pub_session);
 	drop(track);
 	drop(broadcast);
