@@ -56,6 +56,9 @@ struct Args {
 	#[arg(long, env = "MP_PHASE5_RELAY_URL")]
 	relay_url: String,
 
+	#[arg(long, env = "MP_PHASE5_BROADCAST_PATH", default_value = "late-join")]
+	broadcast_path: String,
+
 	#[arg(long, env = "MP_PHASE5_SCHEDULE_DIR")]
 	schedule_dir: PathBuf,
 
@@ -178,7 +181,10 @@ async fn run_early(args: Args) -> Result<()> {
 		.await
 		.context("early announcement timeout")?
 		.context("early origin closed")?;
-	ensure!(path.as_str() == "late-join", "unexpected early broadcast path: {path}");
+	ensure!(
+		path.as_str() == args.broadcast_path,
+		"unexpected early broadcast path: {path}"
+	);
 	let track = broadcast
 		.context("missing early broadcast")?
 		.track("state")
@@ -270,7 +276,10 @@ async fn run_late(args: Args) -> Result<()> {
 		.await
 		.context("late announcement timeout")?
 		.context("late origin closed")?;
-	ensure!(path.as_str() == "late-join", "unexpected late broadcast path: {path}");
+	ensure!(
+		path.as_str() == args.broadcast_path,
+		"unexpected late broadcast path: {path}"
+	);
 	let track = broadcast
 		.context("missing late broadcast")?
 		.track("state")
@@ -410,7 +419,10 @@ async fn run_publisher(args: Args) -> Result<()> {
 	let started_ns = monotonic_ns();
 	let origin = Origin::random().produce();
 	let mut broadcast = origin
-		.create_broadcast("late-join", moq_net::broadcast::Route::new().with_announce(true))
+		.create_broadcast(
+			&args.broadcast_path,
+			moq_net::broadcast::Route::new().with_announce(true),
+		)
 		.context("create Phase 5 broadcast")?;
 	let track_info = moq_net::track::Info::default().with_latency_max(TRACK_LATENCY_MAX);
 	let mut track = broadcast
