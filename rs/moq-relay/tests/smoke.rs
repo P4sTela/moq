@@ -353,6 +353,25 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	}))
 	.await;
 
+	let current_state_ttfs_ms = peer_observations
+		.iter()
+		.map(|peer| {
+			peer["timing_ms"]["current_state_ttfs"]
+				.as_f64()
+				.expect("peer TTFS is numeric")
+		})
+		.sum::<f64>()
+		/ peer_count as f64;
+	let history_fetch_ms = peer_observations
+		.iter()
+		.map(|peer| {
+			peer["timing_ms"]["history_fetch"]
+				.as_f64()
+				.expect("peer FETCH time is numeric")
+		})
+		.sum::<f64>()
+		/ peer_count as f64;
+
 	if let Some(path) = std::env::var_os("MOQ_PHASE5_ARTIFACT") {
 		let artifact = serde_json::json!({
 			"schema_version": 1,
@@ -366,6 +385,10 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 			},
 			"current_state": {"sequence": 1, "payload": "state-1"},
 			"history": {"sequence": 0, "payload": "state-0"},
+			"timing_ms": {
+				"current_state_ttfs": current_state_ttfs_ms,
+				"history_fetch": history_fetch_ms
+			},
 			"peers": peer_observations,
 			"source_alive": true
 		});
