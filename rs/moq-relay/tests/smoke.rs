@@ -300,6 +300,35 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		.expect("historical frame receive failed")
 		.expect("historical group closed");
 	assert_eq!(&historical_frame.payload[..], b"state-0");
+
+	if let Some(path) = std::env::var_os("MOQ_PHASE5_ARTIFACT") {
+		let artifact = serde_json::json!({
+			"schema_version": 1,
+			"test": "relay_websocket_late_join_replays_retained_history_while_source_alive",
+			"cache": {
+				"capacity": "64MiB",
+				"duration_ms": 5000,
+				"cluster_linger_ms": 5000,
+				"track_latency_max_ms": 30000
+			},
+			"current_state": {
+				"sequence": late_group.sequence,
+				"payload": String::from_utf8(late_frame.payload.to_vec()).expect("current payload is UTF-8")
+			},
+			"history": {
+				"sequence": historical.sequence,
+				"payload": String::from_utf8(historical_frame.payload.to_vec()).expect("history payload is UTF-8")
+			},
+			"timing_ms": {
+				"current_state_ttfs": late_ttfs_ms,
+				"history_fetch": history_ttfs_ms
+			},
+			"source_alive": true
+		});
+		let encoded = serde_json::to_vec_pretty(&artifact).expect("serialize Phase 5 artifact");
+		std::fs::write(path, encoded).expect("write Phase 5 artifact");
+	}
+
 	eprintln!(
 		"phase5_late_join cache_duration=5s current_sequence=1 history_sequence=0 ttfs_ms={late_ttfs_ms:.3} history_ttfs_ms={history_ttfs_ms:.3} source_alive=true"
 	);
