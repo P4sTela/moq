@@ -42,6 +42,15 @@ async fn build_web(port: u16, ws: bool) -> Web {
 /// `Some(duration)` additionally installs the relay's cache-duration ceiling and
 /// a finite byte budget for the Phase 5 late-join cases.
 async fn build_web_with_cache(port: u16, ws: bool, cache_duration: Option<Duration>) -> Web {
+	build_web_with_cache_and_stats(port, ws, cache_duration, None).await.0
+}
+
+async fn build_web_with_cache_and_stats(
+	port: u16,
+	ws: bool,
+	cache_duration: Option<Duration>,
+	stats: Option<moq_net::stats::Registry>,
+) -> (Web, Option<moq_net::stats::Registry>) {
 	// Crypto provider is process-global; reinstalls after the first one are
 	// no-ops, but the test binary may run before any other moq code does.
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -63,6 +72,9 @@ async fn build_web_with_cache(port: u16, ws: bool, cache_duration: Option<Durati
 	// late-joiner to exercise the retained relay track.
 	cluster_config.linger = Some(Duration::from_secs(5));
 	let mut cluster = Cluster::new(cluster_config).expect("cluster init");
+	if let Some(stats) = &stats {
+		cluster = cluster.with_stats(stats.clone());
+	}
 	if let Some(duration) = cache_duration {
 		let mut cache_config = CacheConfig::default();
 		cache_config.capacity = Some("64MiB".into());
@@ -82,7 +94,7 @@ async fn build_web_with_cache(port: u16, ws: bool, cache_duration: Option<Durati
 	web_config.ws = ws;
 	web_config.http.listen = Some(format!("127.0.0.1:{port}").parse().expect("parse listen"));
 
-	Web::new(auth, cluster, server.certificates(), web_config)
+	(Web::new(auth, cluster, server.certificates(), web_config), stats)
 }
 
 fn free_tcp_port() -> u16 {
@@ -141,6 +153,25 @@ async fn spawn_relay_with_cache(cache_duration: Option<Duration>) -> (u16, tokio
 	(port, handle)
 }
 
+async fn spawn_relay_with_cache_and_stats(
+	cache_duration: Option<Duration>,
+) -> (u16, tokio::task::JoinHandle<()>, moq_net::stats::Registry) {
+	let port = free_tcp_port();
+	let stats = moq_net::stats::Registry::new(moq_net::stats::Config::new());
+	let (web, stats) = build_web_with_cache_and_stats(port, true, cache_duration, Some(stats.clone())).await;
+	let stats = stats.expect("enabled stats registry");
+
+	let (server_result_tx, mut server_result_rx) = tokio::sync::oneshot::channel();
+	let handle = tokio::spawn(async move {
+		// `Web::run` only returns on error; in tests we abort it at teardown.
+		let _ = server_result_tx.send(web.run().await);
+	});
+
+	wait_for_http(port, &mut server_result_rx).await;
+
+	(port, handle, stats)
+}
+
 fn client() -> moq_native::Client {
 	client_version(None)
 }
@@ -173,7 +204,7 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 		.unwrap_or(1);
 	assert!(matches!(peer_count, 1 | 4 | 8), "peer count must be one of 1, 4, or 8");
 
-	let (port, web_handle) = spawn_relay_with_cache(Some(Duration::from_secs(5))).await;
+	let (port, web_handle, stats) = spawn_relay_with_cache_and_stats(Some(Duration::from_secs(5))).await;
 	let url: url::Url = format!("ws://127.0.0.1:{port}/phase5").parse().expect("parse url");
 
 	// Publish an overwrite-style current-state track with two complete groups.
@@ -353,6 +384,16 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	}))
 	.await;
 
+	let fetch_telemetry =
+		stats
+			.report()
+			.traffic
+			.into_iter()
+			.fold(moq_net::stats::Traffic::default(), |mut totals, entry| {
+				totals.add(entry.publisher);
+				totals.add(entry.subscriber);
+				totals
+			});
 	let current_state_ttfs_ms = peer_observations
 		.iter()
 		.map(|peer| {
@@ -389,6 +430,12 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 				"current_state_ttfs": current_state_ttfs_ms,
 				"history_fetch": history_fetch_ms
 			},
+			"fetch_telemetry": {
+				"fetches": fetch_telemetry.fetches,
+				"fetches_local": fetch_telemetry.fetches_local,
+				"fetches_dynamic": fetch_telemetry.fetches_dynamic,
+				"fetches_miss": fetch_telemetry.fetches_miss
+			},
 			"peers": peer_observations,
 			"source_alive": true
 		});
@@ -397,7 +444,11 @@ async fn relay_websocket_late_join_replays_retained_history_while_source_alive()
 	}
 
 	eprintln!(
-		"phase5_late_join peer_count={peer_count} cache_duration=5s current_sequence=1 history_sequence=0 source_alive=true"
+		"phase5_late_join peer_count={peer_count} cache_duration=5s current_sequence=1 history_sequence=0 source_alive=true fetches={} local={} dynamic={} miss={}",
+		fetch_telemetry.fetches,
+		fetch_telemetry.fetches_local,
+		fetch_telemetry.fetches_dynamic,
+		fetch_telemetry.fetches_miss
 	);
 
 	drop(pub_session);
