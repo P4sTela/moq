@@ -4362,6 +4362,7 @@ dependencies = [
  "clap",
  "humantime",
  "humantime-serde",
+ "libc",
  "moq-native",
  "moq-net",
  "rand 0.10.2",
@@ -4371,6 +4372,7 @@ dependencies = [
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "url",
 ]
 
 [[package]]
